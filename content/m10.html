@@ -1,0 +1,124 @@
+<section class="hero">
+  <p class="eyebrow">Module 10 · 25 minutes</p>
+  <h1>Memory: heaps, stacks and static allocation</h1>
+  <p class="lede">FreeRTOS has its own allocator, separate from the C library's. Understanding that split turns “random reset after two hours” into a number you can budget.</p>
+  <ul class="chips">
+    <li class="chip">heap_1…heap_5</li>
+    <li class="chip">Static allocation</li>
+    <li class="chip">Stack overflow</li>
+    <li class="chip">Fragmentation</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Choose a heap scheme from determinism and fragmentation needs.</li>
+      <li>Move a project to fully static allocation.</li>
+      <li>Produce a memory budget with measured numbers.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Five heap implementations</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Scheme</th><th>Frees</th><th>Coalesces</th><th>Deterministic</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td><code>heap_1</code></td><td>Never</td><td>n/a</td><td>Yes</td><td>Create everything at boot</td></tr>
+    <tr><td><code>heap_2</code></td><td>Yes</td><td><strong>No</strong></td><td>Fragments</td><td>Deprecated — do not use for new code</td></tr>
+    <tr><td><code>heap_3</code></td><td>Yes</td><td>via <code>malloc</code></td><td>No</td><td>When policy requires the C allocator</td></tr>
+    <tr><td><code>heap_4</code></td><td>Yes</td><td>Yes</td><td>Yes, with coalescing</td><td><strong>Default choice</strong></td></tr>
+    <tr><td><code>heap_5</code></td><td>Yes</td><td>Yes</td><td>Like heap_4</td><td>RAM split across regions (TCM + SRAM)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Exactly <strong>one</strong> heap file may be linked, and it is used only for kernel objects and task stacks. Your driver's <code>malloc</code> calls go to the C library — a separate heap with separate failure modes. Keep it that way; mixing them is a common source of “out of memory” confusion.</p>
+
+<pre><code>printf("kernel heap: free now %u, minimum ever %u\n",
+       (unsigned)xPortGetFreeHeapSize(),
+       (unsigned)xPortGetMinimumEverFreeHeapSize());</code></pre>
+
+<p>The second number is the one that matters. If it approaches zero, you are one feature away from a failed <code>xTaskCreate</code> in the field. Keep at least 25% headroom, or move to static allocation.</p>
+
+<h2>Fragmentation and static allocation</h2>
+
+<p><code>heap_4</code> coalesces adjacent free blocks, so fragmentation is bounded but not zero: alternating allocate/free of different sizes can still split blocks over months of runtime. Two defences:</p>
+
+<ol class="steps">
+  <li><strong>Create everything at boot</strong> and never allocate again. Fragmentation cannot grow if nothing is freed.</li>
+  <li><strong>Static allocation</strong> — every object lives in <code>.bss</code>, sized at link time, with zero runtime allocation risk. Most safety standards require it.</li>
+</ol>
+
+<pre><code>/* configSUPPORT_STATIC_ALLOCATION = 1 */
+static StaticTask_t xSensorTaskTCB;
+static StackType_t  xSensorStack[384];
+
+xTaskCreateStatic(vSensorTask, "sensor", 384, NULL, 4,
+                  xSensorStack, &amp;xSensorTaskTCB);
+
+static StaticQueue_t xQueueCB;
+static uint8_t xQueueStorage[16 * sizeof(SensorSample_t)];
+
+xQueueCreateStatic(16, sizeof(SensorSample_t),
+                   xQueueStorage, &amp;xQueueCB);</code></pre>
+
+<p>With static allocation you must also supply <code>vApplicationGetIdleTaskMemory()</code> and, when <code>configUSE_TIMERS</code> is 1, <code>vApplicationGetTimerTaskMemory()</code>. The link fails without them — which is the point: it forces you to account for the kernel's own tasks.</p>
+
+<pre><code>void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCB,
+                                   StackType_t **ppuxIdleStack,
+                                   uint32_t *pulIdleStackSize)
+{
+    static StaticTask_t xIdleTCB;
+    static StackType_t  xIdleStack[configMINIMAL_STACK_SIZE];
+
+    *ppxIdleTaskTCB  = &amp;xIdleTCB;
+    *ppuxIdleStack   = xIdleStack;
+    *pulIdleStackSize = configMINIMAL_STACK_SIZE;
+}</code></pre>
+
+<h2>Stack overflow: detection and limits</h2>
+
+<pre><code>void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    taskDISABLE_INTERRUPTS();
+    panic_log("stack overflow in %s", pcTaskName);
+    for (;;) { }
+}</code></pre>
+
+<p><code>configCHECK_FOR_STACK_OVERFLOW</code> = 1 checks the stack pointer at each context switch (cheap, catches gross overflows). = 2 also verifies a canary at the stack's end (catches more, slightly slower). Both are development aids, not guarantees: corruption can happen before the check runs. Final sizes come from Module 4's measurement plus margin.</p>
+
+<p>Watch for the silent consumers: <code>printf</code> with floats, <code>snprintf</code> of long strings, deep HAL call chains, large local arrays, and floating-point context saving on ports that do it.</p>
+
+<h2>A memory budget you can defend</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Item</th><th>RAM</th><th>Source of the number</th></tr></thead>
+  <tbody>
+    <tr><td>Kernel objects</td><td>3.2 KB</td><td>queues, mutexes, TCBs</td></tr>
+    <tr><td>Task stacks (5 tasks)</td><td>5.5 KB</td><td>high-water mark + 30%</td></tr>
+    <tr><td><code>heap_4</code> minimum free</td><td>1.8 KB</td><td><code>xPortGetMinimumEverFreeHeapSize</code></td></tr>
+    <tr><td>Driver buffers</td><td>4.0 KB</td><td>UART DMA, SD sector buffer</td></tr>
+    <tr><td>C library heap</td><td>2.0 KB</td><td><code>printf</code>, <code>snprintf</code></td></tr>
+    <tr><td><strong>Total</strong></td><td><strong>16.5 KB of 20 KB</strong></td><td>17% headroom</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>If you cannot fill in the “source” column, you do not yet know whether the product fits. Put this table in the repository next to the linker script, and update it when a feature adds a buffer.</p>
+
+<h2>Lab: find the real stack requirement</h2>
+
+<ol class="steps">
+  <li>Set every task to 512 words, enable check level 2, and run the full application for ten minutes with every error path exercised.</li>
+  <li>Print <code>uxTaskGetStackHighWaterMark</code> for each task every ten seconds.</li>
+  <li>Cut each stack to <code>used + 30%</code>, rounded up to a multiple of eight words, and re-run.</li>
+  <li>Add one <code>printf("%f")</code> in a task and watch its high-water mark collapse.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>Dynamic allocation is a convenience for prototypes and a risk for products. Know which heap you are spending, measure its minimum, and decide deliberately whether the final build allocates at all.</p>
+</div>

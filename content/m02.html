@@ -1,0 +1,148 @@
+<section class="hero">
+  <p class="eyebrow">Module 02 · 30 minutes</p>
+  <h1>Get a build running</h1>
+  <p class="lede">Two tasks, two rates, no HAL delays. Get this working from scratch once and every later module becomes an experiment instead of a theory lesson.</p>
+  <ul class="chips">
+    <li class="chip">STM32CubeMX</li>
+    <li class="chip">ESP-IDF</li>
+    <li class="chip">POSIX port</li>
+    <li class="chip">Bring-up</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Choose a board and toolchain route that matches your goal.</li>
+      <li>Add the kernel, one port and one heap file to a project.</li>
+      <li>Build a two-task program and explain why each task has its own wake time.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Pick a route</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Route</th><th>Hardware</th><th>Toolchain</th><th>Good for</th></tr></thead>
+  <tbody>
+    <tr><td><strong>A. Vendor IDE</strong></td><td>STM32 Nucleo / Discovery</td><td>CubeMX + CubeIDE (or CubeCLT + CMake)</td><td>Fastest start; generated config you can read and edit</td></tr>
+    <tr><td><strong>B. ESP-IDF</strong></td><td>ESP32 / S3 / C3</td><td><code>idf.py</code>, CMake</td><td>Wi-Fi and BLE products; FreeRTOS is native</td></tr>
+    <tr><td><strong>C. Pico SDK</strong></td><td>RP2040 / RP2350</td><td>arm-none-eabi-gcc + CMake</td><td>Cheap dual-core; SMP port available</td></tr>
+    <tr><td><strong>D. Host simulation</strong></td><td>None</td><td>gcc + FreeRTOS POSIX port</td><td>Learning the API with zero hardware risk</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Route D is underrated. The kernel repository contains a POSIX port under <code>portable/ThirdParty/GCC/Posix</code>, and the main FreeRTOS repository ships a <code>Posix_GCC</code> demo. Your tasks become pthreads, so queues, mutexes, notifications and timers all work, and you can <code>printf</code> your way through every lab in this course. It is not deterministic enough for production, but it is the fastest way to internalize the API.</p>
+
+<div class="callout warn">
+  <span class="label">Version note</span>
+  <p>Use <strong>FreeRTOS-Kernel V11.3.x</strong> for learning. For a product, start from the <strong>202604 LTS</strong> release (kernel 11.3.0, maintained until April 2028). Both are MIT licensed. Directory names occasionally move between releases — the demo's <code>CMakeLists.txt</code> always names the port it uses.</p>
+</div>
+
+<h2>What a project needs (and nothing else)</h2>
+
+<ol class="steps">
+  <li><strong>Core sources</strong>: <code>tasks.c</code>, <code>queue.c</code>, <code>list.c</code>, plus <code>timers.c</code>, <code>event_groups.c</code> and <code>stream_buffer.c</code> if you use those features.</li>
+  <li><strong>Exactly one port directory</strong> for your CPU and compiler, e.g. <code>portable/GCC/ARM_CM4F</code>. Two ports means duplicate handler symbols.</li>
+  <li><strong>Exactly one heap file</strong> from <code>portable/MemMang</code>, e.g. <code>heap_4.c</code>.</li>
+  <li><strong>FreeRTOSConfig.h</strong> on the include path (Module 3).</li>
+  <li><strong>One interrupt priority group</strong> configured so that NVIC priority bits are usable (on Cortex-M, <code>NVIC_PriorityGroup_4</code> in HAL terms).</li>
+</ol>
+
+<h2>Route A: STM32 + CubeMX, step by step</h2>
+
+<ol class="steps">
+  <li><strong>Install</strong> CubeMX, CubeIDE (or CubeCLT + CMake + Ninja), and the STM32Cube firmware package for your board.</li>
+  <li><strong>New project</strong> → select the exact MCU or board, e.g. NUCLEO-F411RE.</li>
+  <li><strong>Clock tree</strong>: enable HSE/LSE as your board requires and set a known SYSCLK. Confirm <code>SystemCoreClock</code> matches your config value.</li>
+  <li><strong>Debug</strong>: SYS → Serial Wire. If CubeMX warns that SysTick is used by the HAL, move the HAL timebase to TIM6 — FreeRTOS needs SysTick for its own tick.</li>
+  <li><strong>UART</strong>: USART2 asynchronous, 115200 8N1, so you can retarget <code>printf</code>.</li>
+  <li><strong>Middleware → FREERTOS</strong>. CubeMX defaults to the CMSIS-RTOS2 wrapper. For this course, prefer the native API: either disable the wrapper and add the kernel sources yourself, or keep the wrapper and read the native calls it maps to. Learning happens in the native API.</li>
+  <li><strong>Generate</strong> with “pair of .c/.h files per peripheral”, then open <code>Core/Src/freertos.c</code> and read <code>MX_FREERTOS_Init()</code>.</li>
+  <li><strong>Retarget printf</strong> to <code>ITM_SendChar</code> or a UART transmit. Blocking UART is fine for bring-up; Module 9 explains why it is not fine in a shared product.</li>
+</ol>
+
+<h2>Route B: ESP-IDF</h2>
+
+<pre><code>idf.py create-project freertos-lab
+cd freertos-lab
+idf.py set-target esp32s3
+idf.py menuconfig      # Component config -&gt; FreeRTOS
+idf.py build flash monitor</code></pre>
+
+<p>FreeRTOS is the native runtime, so <code>xTaskCreate</code>, queues and semaphores are available with no integration step. Two ESP-specific details: <code>xTaskCreate</code> behaves like <code>xTaskCreatePinnedToCore(..., tskNO_AFFINITY)</code>, and the Wi-Fi stack already owns several tasks — inspect <code>uxTaskGetSystemState</code> early to see who shares the CPU with you.</p>
+
+<h2>Route C: host simulation</h2>
+
+<pre><code>git clone https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+cd FreeRTOS-Kernel
+
+gcc -I include -I portable/ThirdParty/GCC/Posix \
+    main.c tasks.c queue.c list.c timers.c event_groups.c stream_buffer.c \
+    portable/ThirdParty/GCC/Posix/port.c \
+    portable/MemMang/heap_4.c \
+    -lpthread -o freertos_lab</code></pre>
+
+<p>If that exact file list does not match your checkout, copy the source list from the <code>Posix_GCC</code> demo's build file. The point is the shape: core + one port + one heap + your <code>main.c</code>.</p>
+
+<h2>The first program</h2>
+
+<pre><code>#include "FreeRTOS.h"
+#include "task.h"
+
+static void vLedTask(void *pvParameters)
+{
+    const TickType_t xPeriod = (TickType_t)(uintptr_t)pvParameters;
+    TickType_t xLastWake = xTaskGetTickCount();
+
+    for (;;) {
+        bsp_led_toggle();
+        xTaskDelayUntil(&amp;xLastWake, xPeriod);   /* absolute period */
+    }
+}
+
+int main(void)
+{
+    bsp_init();                                  /* clocks, GPIO, UART */
+
+    xTaskCreate(vLedTask, "led_fast", 256,
+                (void *)pdMS_TO_TICKS(100), 2, NULL);
+    xTaskCreate(vLedTask, "led_slow", 256,
+                (void *)pdMS_TO_TICKS(500), 2, NULL);
+
+    vTaskStartScheduler();
+
+    /* Only reached if the heap could not create the idle/timer task. */
+    for (;;) { }
+}</code></pre>
+
+<p>Notice what is absent: no <code>while (!flag)</code>, no global tick counter, no <code>HAL_Delay</code>. Each task keeps its own wake time on its own stack, which is why the same function can serve both LEDs with different periods.</p>
+
+<h2>When the build fights back</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td><code>undefined reference to vPortSVCHandler</code></td><td>Port directory not compiled</td><td>Add the matching <code>portable/&lt;compiler&gt;/&lt;arch&gt;</code> sources</td></tr>
+    <tr><td><code>undefined reference to pvPortMalloc</code></td><td>No heap file</td><td>Add exactly one of <code>heap_1/2/3/4/5.c</code></td></tr>
+    <tr><td>Handlers defined twice</td><td>Two ports, or startup file also defines them</td><td>Remove the duplicate port; map <code>vPortSVCHandler</code> to <code>SVC_Handler</code> in the startup file</td></tr>
+    <tr><td><code>vTaskStartScheduler</code> returns</td><td>Heap too small for idle/timer tasks</td><td>Raise <code>configTOTAL_HEAP_SIZE</code>, add the malloc-failed hook</td></tr>
+    <tr><td>Board resets when the first task runs</td><td>Scheduler started before the FPU/clock is configured</td><td>Initialise clocks and FPU before <code>vTaskStartScheduler()</code></td></tr>
+    <tr><td>Nothing blinks, no crash</td><td>Both tasks blocked forever, or priority 0 with the idle task running</td><td>Check periods, priorities and that the tick is running</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Lab: rebuild it cold</h2>
+
+<ol class="steps">
+  <li><strong>Build and flash</strong> the two-task program. Confirm 100 ms and 500 ms blink rates with a scope or a stopwatch.</li>
+  <li><strong>Delete the project</strong> and recreate it from scratch without looking at this page. Target: under 15 minutes.</li>
+  <li><strong>Break it on purpose</strong>: remove the port directory, then the heap file, and read both linker errors.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>Kernel integration is three directories and one header. If you can assemble that from memory, toolchain problems stop being mysterious and start being ordinary.</p>
+</div>

@@ -1,0 +1,150 @@
+<section class="hero">
+  <p class="eyebrow">Module 12 · 35 minutes</p>
+  <h1>Debugging and instrumentation</h1>
+  <p class="lede">The kernel already knows what is running, how much stack is left and how late each task is. Turn that knowledge on before you need it.</p>
+  <ul class="chips">
+    <li class="chip">Asserts</li>
+    <li class="chip">Runtime stats</li>
+    <li class="chip">Trace</li>
+    <li class="chip">HardFault</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Use kernel instrumentation to answer “what is running, and how much stack is left”.</li>
+      <li>Decode a HardFault down to the offending instruction.</li>
+      <li>Recognize the ten classic FreeRTOS failure signatures.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>First line of defence: the hooks</h2>
+
+<p>Before any clever tooling, make failure loud and specific:</p>
+
+<pre><code>#define configASSERT(x) \
+    if ((x) == 0) { taskDISABLE_INTERRUPTS(); assert_fail(__FILE__, __LINE__); }
+
+void assert_fail(const char *file, int line)
+{
+    /* Retained RAM or RTT: survives the reset you are about to do. */
+    fault_log("ASSERT %s:%d", file, line);
+    nvic_system_reset();
+}</code></pre>
+
+<p>With asserts on, passing a NULL queue, an invalid priority or a mutex from an ISR becomes a precise file-and-line report instead of a hang. Add the stack-overflow and malloc-failed hooks from Module 10, and log to a buffer that survives reset (backup SRAM or RTT).</p>
+
+<h2>What is running right now</h2>
+
+<pre><code>/* Requires configUSE_TRACE_FACILITY and
+   configUSE_STATS_FORMATTING_FUNCTIONS. */
+static char pcBuffer[1024];
+
+vTaskListTasks(pcBuffer, sizeof pcBuffer);
+printf("%s\n", pcBuffer);
+
+/* Name  State  Prio  Stack  Num */
+/* cli   B      2     118    4   */
+/* sensor R     4     212    2   */
+/* IDLE  R      0      92    6   */</code></pre>
+
+<p>The stack column is the high-water mark in words: the smallest free stack ever observed. A number under about 30 words is a warning; zero is a crash waiting for a slightly longer code path. <code>vTaskGetRunTimeStatistics()</code> adds a percentage column once runtime stats are enabled.</p>
+
+<pre><code>#define configGENERATE_RUN_TIME_STATS        1
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()  prvRuntimeTimerInit()
+#define portGET_RUN_TIME_COUNTER_VALUE()          prvRuntimeCounter()
+
+/* A 32-bit timer running at 10x the tick rate gives 0.1% resolution.
+   Call vTaskGetRunTimeStatistics() from a low-priority task, not an ISR. */</code></pre>
+
+<p>Runtime stats answer the question “is the CPU busy, and with what?”. Idle time below ~10% means no headroom for the next feature, and a task consuming far more than its design estimate is usually polling or retrying something.</p>
+
+<h2>Timeline tools</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Tool</th><th>What you get</th><th>Setup cost</th></tr></thead>
+  <tbody>
+    <tr><td>SEGGER SystemView</td><td>Task/ISR timeline, blocking reasons, CPU load</td><td>Low: add the FreeRTOS recorder files, stream over RTT</td></tr>
+    <tr><td>Percepio Tracealyzer</td><td>Timeline plus dependency and response-time analysis</td><td>Medium: recorder library, snapshot or streaming</td></tr>
+    <tr><td>GPIO + logic analyser</td><td>Ground truth for latency and jitter</td><td>Lowest: one pin set/clear per event</td></tr>
+    <tr><td><code>vTaskListTasks</code> over UART</td><td>Snapshot of states and stacks</td><td>Trivial</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Do not underestimate the GPIO method. A pin toggled at the start of the ISR and cleared at the end of the task's work gives an unambiguous latency measurement that no tool can argue with.</p>
+
+<h2>Decoding a HardFault</h2>
+
+<p>On Cortex-M, the fault handler can read the exception frame that the hardware pushed onto the stack of the interrupted context:</p>
+
+<pre><code>void HardFault_Handler(void)
+{
+    __asm volatile (
+        "tst lr, #4        \n"
+        "ite eq            \n"
+        "mrseq r0, msp     \n"
+        "mrsne r0, psp     \n"
+        "b hard_fault_c    \n");
+}
+
+void hard_fault_c(uint32_t *pStackFrame)
+{
+    uint32_t pc = pStackFrame[6];      /* stacked PC    */
+    uint32_t lr = pStackFrame[5];      /* stacked LR    */
+    uint32_t cfsr = *(volatile uint32_t *)0xE000ED28;
+    uint32_t hfsr = *(volatile uint32_t *)0xE000ED2C;
+
+    fault_log("HFSR %08lx CFSR %08lx PC %08lx LR %08lx",
+              (unsigned long)hfsr, (unsigned long)cfsr,
+              (unsigned long)pc, (unsigned long)lr);
+    for (;;) { }
+}</code></pre>
+
+<p>Then resolve <code>pc</code> with <code>addr2line</code> or your IDE's disassembly view. CFSR classifies the fault (usage, bus, memory management) and <code>BFAR</code>/<code>MMFAR</code> give the offending address when valid. “It crashes randomly” becomes “it dereferenced 0x00000004 at line 212”.</p>
+
+<h2>Symptom → cause</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Symptom</th><th>Most likely cause</th></tr></thead>
+  <tbody>
+    <tr><td>One task never runs</td><td>Starvation by a higher-priority task that never blocks, or priorities inverted</td></tr>
+    <tr><td>Board resets under load</td><td>ISR above the syscall ceiling calling kernel APIs, or uncleared interrupt flag</td></tr>
+    <tr><td>Works at 25 °C, fails warm</td><td>Stack margin too thin — a longer path or deeper ISR nesting overflows</td></tr>
+    <tr><td>Hangs after a few hours</td><td>Heap exhaustion or fragmentation; check the minimum-ever-free value</td></tr>
+    <tr><td>Queue “loses” data</td><td>Zero-timeout sends failing silently; count and report them</td></tr>
+    <tr><td>Latency spikes every few seconds</td><td>Long critical section, flash write, or a blocking call in a timer callback</td></tr>
+    <tr><td>Mutex deadlock</td><td>Two locks taken in opposite orders, or a task deleted while holding one</td></tr>
+    <tr><td>printf output interleaves</td><td>Multiple tasks sharing one UART without a lock or a logging task</td></tr>
+    <tr><td>Values change spontaneously</td><td>Shared variable without protection; <code>volatile</code> is not a lock</td></tr>
+    <tr><td>Assert on <code>xQueueSend</code> from ISR</td><td>Non-FromISR API in interrupt context</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Test on the host too</h2>
+
+<p>The POSIX port from Module 2 is not only a learning tool. Pure logic — parsers, filters, state machines, protocol framing — can run under the same kernel on your laptop with mocked HAL functions, inside a normal test runner. That gives you fast, repeatable tests for the parts that do not need real hardware, while the board tests cover timing and electrical behaviour.</p>
+
+<pre><code>/* Host test sketch: feed a frame, assert the parsed result. */
+void test_frame_crc_rejects_corruption(void)
+{
+    frame_t f = { .len = 4, .payload = {1, 2, 3, 4}, .crc = 0xDEAD };
+    TEST_ASSERT_FALSE(frame_validate(&amp;f));
+}</code></pre>
+
+<h2>Lab: instrument the capstone before building it</h2>
+
+<ol class="steps">
+  <li>Enable <code>vTaskListTasks</code> and print it once per second from the lowest-priority task.</li>
+  <li>Enable runtime stats with a 10x tick timer and print the percentage column.</li>
+  <li>Force a HardFault (dereference a bad pointer) and decode <code>pc</code> and CFSR to a source line.</li>
+  <li>Add GPIO markers around one ISR and its task, and measure the end-to-end latency with a scope.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>Do not debug a scheduler by guessing. Asserts name the error, the task list names the state, runtime stats name the cost, and the stacked PC names the instruction.</p>
+</div>

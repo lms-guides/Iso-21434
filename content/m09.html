@@ -1,0 +1,110 @@
+<section class="hero">
+  <p class="eyebrow">Module 09 · 30 minutes</p>
+  <h1>Software timers and interrupt discipline</h1>
+  <p class="lede">A timer callback is not an ISR, and an ISR is not a task. Confusing the three contexts is where intermittent, load-dependent crashes come from.</p>
+  <ul class="chips">
+    <li class="chip">Software timers</li>
+    <li class="chip">Daemon task</li>
+    <li class="chip">ISR rules</li>
+    <li class="chip">Deferred work</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Use one-shot and auto-reload timers without blocking the daemon.</li>
+      <li>Apply the ISR rules, including the NVIC priority ceiling.</li>
+      <li>Choose a deferred-processing pattern for each interrupt source.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Software timers</h2>
+
+<p>Timer callbacks execute in the context of the <strong>timer daemon task</strong> (<code>configTIMER_TASK_PRIORITY</code>), driven by a command queue. They are convenient for debounce, timeouts, heartbeat LEDs and periodic housekeeping.</p>
+
+<pre><code>static TimerHandle_t xLedTimer;
+
+static void vLedCallback(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    gpio_toggle(LED_STATUS);
+}
+
+xLedTimer = xTimerCreate("led",
+                         pdMS_TO_TICKS(500),
+                         pdTRUE,          /* auto-reload */
+                         NULL,            /* timer ID   */
+                         vLedCallback);
+
+if (xLedTimer != NULL) {
+    xTimerStart(xLedTimer, 0);
+}</code></pre>
+
+<p>Useful variations:</p>
+
+<ul>
+  <li><code>xTimerChangePeriod(t, pdMS_TO_TICKS(new), 0)</code> — change a period at runtime.</li>
+  <li><code>xTimerReset(t, 0)</code> — restart the countdown; perfect for a “no event for 2 s” watchdog-style timeout.</li>
+  <li><code>xTimerStartFromISR</code>, <code>xTimerStopFromISR</code>, <code>xTimerResetFromISR</code> — the only timer calls allowed from an ISR.</li>
+  <li><code>pvTimerGetTimerID()</code> — one callback can serve several timers if it can tell them apart.</li>
+</ul>
+
+<div class="callout warn">
+  <span class="label">Callback rules</span>
+  <p>Callbacks must be <strong>short and non-blocking</strong>: no <code>vTaskDelay</code>, no queue receive with a timeout, no paragraph-sized <code>printf</code>. One slow callback delays every other timer in the system, including ones whose deadlines matter.</p>
+</div>
+
+<p>Also remember that <code>xTimerStart</code> is a <em>command</em>, not an immediate action. With a zero block time it can fail if the command queue is full — check the return value when starting timers in a burst.</p>
+
+<h2>ISR rules for FreeRTOS-aware interrupts</h2>
+
+<ol class="steps">
+  <li><strong>Be short.</strong> Post data, set a flag, clear the source, yield. Target single-digit microseconds.</li>
+  <li><strong>Only <code>...FromISR</code> APIs.</strong> <code>xQueueSend</code> in an ISR may block and will corrupt scheduler state.</li>
+  <li><strong>Handle <code>pxHigherPriorityTaskWoken</code></strong> and call <code>portYIELD_FROM_ISR()</code> at the end.</li>
+  <li><strong>Never call <code>printf</code>, <code>malloc</code>, <code>vTaskDelay</code>, mutex operations or blocking driver code.</strong></li>
+  <li><strong>Respect the priority ceiling.</strong> An ISR that calls any kernel API must have an NVIC priority numerically greater than or equal to <code>configMAX_SYSCALL_INTERRUPT_PRIORITY</code> (logically less urgent). More urgent ISRs are never masked by critical sections and must not call the kernel at all.</li>
+  <li><strong>Clear the interrupt flag.</strong> A level-triggered peripheral that is not cleared re-enters forever and starves every task. “The board resets randomly” is often this.</li>
+  <li><strong>Mind the stack.</strong> On Cortex-M without a separate ISR stack, the ISR uses the interrupted task's stack. A deep ISR call chain eats whatever task was running.</li>
+</ol>
+
+<pre><code>void TIM2_IRQHandler(void)
+{
+    BaseType_t xWoken = pdFALSE;
+
+    if (timer_compare_flag()) {
+        timer_clear_compare_flag();           /* 1. clear the source   */
+        ulTimestamp = timer_read_counter();   /* 2. capture, not process */
+        xQueueSendFromISR(xEdgeQueue, &amp;ulTimestamp, &amp;xWoken); /* 3. post */
+    }
+
+    portYIELD_FROM_ISR(xWoken);               /* 4. switch if needed   */
+}</code></pre>
+
+<h2>Deferred-processing patterns</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Pattern</th><th>Mechanism</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>Signal only</td><td>Binary semaphore or notification</td><td>Work can be coalesced; only “latest” matters</td></tr>
+    <tr><td>Every event</td><td>Counting semaphore or queue</td><td>Each event must be handled</td></tr>
+    <tr><td>Data hand-off</td><td>Queue of structs</td><td>ISR produces samples, task consumes</td></tr>
+    <tr><td>Byte stream</td><td>Stream buffer plus DMA</td><td>UART or SPI bursts</td></tr>
+    <tr><td>Bottom half</td><td>Dedicated high-priority task</td><td>Work is long but latency-critical</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Lab: break the ISR contract three ways</h2>
+
+<ol class="steps">
+  <li>Call <code>xQueueSend</code> (the non-ISR version) from the UART ISR. Observe the assert, or the hang if asserts are disabled.</li>
+  <li>Remove <code>portYIELD_FROM_ISR</code>. Measure the added latency with a scope: up to one full tick.</li>
+  <li>Set the UART NVIC priority to 4 while the syscall ceiling is 5, then send a burst while another task is in a critical section. Explain the corruption before fixing it.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>ISRs capture time and data; tasks make decisions. Every millisecond of work you move out of an ISR is latency returned to the whole system.</p>
+</div>

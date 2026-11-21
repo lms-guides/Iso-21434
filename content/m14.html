@@ -1,0 +1,141 @@
+<section class="hero">
+  <p class="eyebrow">Module 14 · 30 minutes</p>
+  <h1>Shipping: hardening and release checklist</h1>
+  <p class="lede">A demo survives a bench session. A product survives a year of brown-outs, a stalled sensor and a firmware update in the field.</p>
+  <ul class="chips">
+    <li class="chip">Watchdog</li>
+    <li class="chip">Fault handling</li>
+    <li class="chip">Power</li>
+    <li class="chip">Release</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Design a watchdog and fault-logging strategy that survives real failures.</li>
+      <li>Budget CPU, RAM and power with margin you can defend.</li>
+      <li>Run a release checklist instead of hoping.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Watchdog design</h2>
+
+<p>The independent watchdog is the only mechanism that recovers from a corrupted heap, a deadlock or a task that silently stopped. Use it as a supervisor, not as a formality:</p>
+
+<ul>
+  <li><strong>One feeder.</strong> A single health task refreshes the watchdog, and only after every supervised task has reported a heartbeat.</li>
+  <li><strong>Timeout from the requirement.</strong> If the product must recover within 5 s, a 2 s watchdog plus reset time fits; pick the number deliberately.</li>
+  <li><strong>Feed late, not early.</strong> Feeding at the top of the loop before the work means a hang after the feed still resets; feeding after the work means a slow iteration can reset a healthy system. Choose per task and document it.</li>
+  <li><strong>Log before reset.</strong> A fault record in backup SRAM or RTT tells you why the next boot happened.</li>
+  <li><strong>Test it.</strong> Add a debug command that blocks a task on purpose and confirm the reset and the log.</li>
+</ul>
+
+<pre><code>/* Boot: report the previous reset cause, then clear it. */
+reset_cause_t cause = reset_cause_read();
+
+if (cause == RESET_WATCHDOG) {
+    fault_log_dump();          /* print the retained fault record */
+    g_stats.watchdog_resets++;
+}
+reset_cause_clear();</code></pre>
+
+<h2>Error handling that scales</h2>
+
+<p>Asserts are for programmer errors — a NULL queue, an impossible state. They should not handle a sensor that is merely absent. Use three tiers:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Tier</th><th>Example</th><th>Response</th></tr></thead>
+  <tbody>
+    <tr><td>Expected error</td><td>I2C NAK, CRC mismatch</td><td>Retry with backoff, count, continue</td></tr>
+    <tr><td>Degraded operation</td><td>SD card removed</td><td>Buffer to RAM, set a fault flag, keep sampling</td></tr>
+    <tr><td>Programmer error</td><td>NULL handle, invalid priority</td><td>Assert, log, reset</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Return codes are not enough on their own: a caller that ignores them turns a recoverable error into a silent one. Either handle it, or log it and propagate it. A global fault bitmap plus a counter per fault class is enough for most products, and it makes the CLI's <code>status</code> command genuinely useful.</p>
+
+<h2>Power and the tick</h2>
+
+<p>If the product is battery powered, idle time becomes a design target:</p>
+
+<ul>
+  <li><strong>Tickless idle</strong> (<code>configUSE_TICKLESS_IDLE</code>) lets the kernel sleep until the next real deadline instead of waking every tick. It needs a low-power timer the port can use, and it changes timing behaviour — test it, do not assume it.</li>
+  <li><strong>WFI in the idle hook</strong> is the cheap version: sleep until the next interrupt, keep the tick.</li>
+  <li><strong>Turn peripherals off</strong> in the lowest-priority task, not in the idle hook, if the ordering matters.</li>
+  <li><strong>Measure.</strong> A multimeter in series with the board over 60 s beats any estimate. Compare run, idle and sleep currents and compute the expected battery life from the duty cycle.</li>
+</ul>
+
+<h2>Firmware update and rollback</h2>
+
+<p>An A/B scheme with a bootloader gives you the recovery path that a watchdog alone cannot:</p>
+
+<ol class="steps">
+  <li><strong>Two slots</strong> — the running image and the candidate. The bootloader selects by a version/validity record.</li>
+  <li><strong>Confirm after self-test.</strong> The new image marks itself valid only after passing its own checks (peripherals, storage, network). Until then, a reset returns to the previous slot.</li>
+  <li><strong>Sign and verify.</strong> A/B gives rollback, not authenticity. Check the image signature and version before booting it.</li>
+  <li><strong>Preserve state</strong> across the update: configuration and calibration live in a separate region, with a schema version.</li>
+</ol>
+
+<h2>Testing strategy</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Layer</th><th>Runs on</th><th>Covers</th></tr></thead>
+  <tbody>
+    <tr><td>Unit tests</td><td>Host + POSIX port, mocked BSP</td><td>Filters, parsers, state machines, framing</td></tr>
+    <tr><td>Integration</td><td>Board, scripted</td><td>Task interactions, queue depths, CLI</td></tr>
+    <tr><td>Timing</td><td>Board + scope/analyser</td><td>Latency, jitter, ISR duration, priority behaviour</td></tr>
+    <tr><td>Fault injection</td><td>Board</td><td>Stalled task, full queue, I2C NAK, SD removal, brown-out</td></tr>
+    <tr><td>Soak</td><td>Board</td><td>24–72 h: heap minimum, stack watermarks, counters</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The POSIX port makes the first layer cheap: the same kernel, the same tasks, but tests run in a second on a laptop and in CI. Keep the BSP narrow so the mock is small.</p>
+
+<h2>Release checklist</h2>
+
+<ul>
+  <li>All asserts kept in the release build, or replaced by logged resets — never silently compiled out.</li>
+  <li>Stack high-water marks ≥ 30% free on every task after the soak, with logging enabled.</li>
+  <li>Kernel heap minimum ≥ 25% free, or fully static allocation.</li>
+  <li>Idle time ≥ 10% under worst-case load; runtime stats captured and archived.</li>
+  <li>Every ISR calls only <code>FromISR</code> APIs and sits at or below the syscall priority ceiling.</li>
+  <li>Every mutex take has a timeout; every queue send has a documented full policy.</li>
+  <li>Watchdog tested by injection, with reset cause and fault log verified across reboot.</li>
+  <li>Brown-out and power-cycle recovery verified with the storage mounted.</li>
+  <li>Compiler warnings clean at <code>-Wall -Wextra</code>; static analysis run on the application code.</li>
+  <li>Version string, git SHA and build date readable from the CLI or a status register.</li>
+  <li>No <code>printf</code> in an ISR or a timer callback; no blocking call while holding a lock.</li>
+  <li>Recovery procedure documented: how to enter the bootloader, how to roll back.</li>
+</ul>
+
+<div class="callout">
+  <span class="label">Certification, if you need it</span>
+  <p>FreeRTOS is MIT-licensed and widely used, but a safety certificate is a property of a specific integration, not of the source. For IEC 61508, ISO 26262 or DO-178C work, look at the safety-certified derivatives and partner offerings (for example SAFERTOS), plus the kernel's MISRA compliance documentation. Budget for the evidence, not just the code.</p>
+</div>
+
+<h2>Where to go next</h2>
+
+<ul>
+  <li><strong>Read the kernel source.</strong> <code>tasks.c</code> and <code>queue.c</code> are readable in an afternoon and explain every behaviour in this course.</li>
+  <li><strong>Read the FreeRTOS-Kernel Book</strong> for the design rationale behind queues, scheduling and the timer daemon.</li>
+  <li><strong>Build the capstone on real hardware</strong>, then add one hard feature: a TCP telemetry link, a bootloader, or an MPU-protected task.</li>
+  <li><strong>Try an SMP port</strong> (RP2040 or a dual-core Cortex-M) to see what changes when two cores run the scheduler at once.</li>
+</ul>
+
+<h2>Final lab: your own checklist</h2>
+
+<ol class="steps">
+  <li>Take your current project and score it against the twelve release items. Be honest.</li>
+  <li>Fix the two cheapest failures this week. Measure again.</li>
+  <li>Write the memory and CPU budget into the repository, with the measurement date.</li>
+  <li>Run a 24-hour soak and keep the log as the baseline for the next release.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>Shipping is mostly remembering: keep the asserts, measure the margins, name the faults, and make recovery a tested path rather than a hope. That is the whole difference between “it works on my desk” and a product.</p>
+</div>

@@ -1,0 +1,120 @@
+<section class="hero">
+  <p class="eyebrow">Module 01 · 20 minutes</p>
+  <h1>Why an RTOS at all</h1>
+  <p class="lede">Before the API, the mental model. FreeRTOS does not make code faster; it makes response time a property you can design, measure and defend.</p>
+  <ul class="chips">
+    <li class="chip">Superloop</li>
+    <li class="chip">Scheduler</li>
+    <li class="chip">Task states</li>
+    <li class="chip">Priorities</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Explain what a superloop cannot do that a preemptive kernel can.</li>
+      <li>Name the five task states and what moves a task between them.</li>
+      <li>State the FreeRTOS priority convention correctly, first time.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>The superloop, and where it breaks</h2>
+
+<p>Almost every embedded project starts like this:</p>
+
+<pre><code>int main(void)
+{
+    bsp_init();
+
+    for (;;) {
+        read_sensor();       /* 2 ms  */
+        update_display();    /* 30 ms */
+        handle_uart();       /* 1 ms  */
+        delay_ms(10);        /* period is 43 ms, not 10 */
+    }
+}</code></pre>
+
+<p>Three structural problems appear as soon as the product grows, and none of them can be fixed by writing the functions better:</p>
+
+<ol class="steps">
+  <li><strong>Latency is the sum of everything else.</strong> A UART byte waits up to 43 ms. Add a feature and every existing response gets slower.</li>
+  <li><strong>Blocking is contagious.</strong> One <code>delay_ms(500)</code> inside a driver stalls the display, the protocol and the watchdog.</li>
+  <li><strong>No composition.</strong> <code>update_display()</code> cannot be reused in a second product with a different timing profile, because its timing is baked into the loop order.</li>
+</ol>
+
+<p>You can fix these with hand-written state machines and timer interrupts — plenty of shipping products do — but you end up re-implementing a scheduler, a queue and a timeout mechanism, with no tests and no documentation.</p>
+
+<h2>What the kernel actually adds</h2>
+
+<ul>
+  <li><strong>Tasks</strong> — independent execution contexts, each with its own stack, that appear to run concurrently on a single core.</li>
+  <li><strong>Preemption</strong> — a higher-priority ready task runs immediately, even in the middle of a lower-priority function.</li>
+  <li><strong>Blocking primitives</strong> — a task waiting for data consumes no CPU and wakes on the event or the timeout.</li>
+  <li><strong>Priority-based determinism</strong> — the highest-priority <em>ready</em> task always runs, so worst-case latency becomes a design property instead of luck.</li>
+</ul>
+
+<p>That last point is the real reason to use an RTOS. Throughput is a pleasant side effect; <strong>bounded response time</strong> is the product.</p>
+
+<h2>The scheduler in one paragraph</h2>
+
+<p>Every task is in exactly one state: <strong>Running</strong> (one per core), <strong>Ready</strong>, <strong>Blocked</strong> (waiting for time or an event, with an optional timeout), <strong>Suspended</strong> (parked explicitly, no timeout), or <strong>Deleted</strong>. The scheduler always runs the highest-priority ready task. On a tie, ready tasks at the same priority take turns one tick each when <code>configUSE_TIME_SLICING</code> is 1.</p>
+
+<p>The <strong>tick</strong> — SysTick on Cortex-M — increments a counter and drives timeouts. The actual context switch happens in the <strong>PendSV</strong> exception, which is configured to the lowest interrupt priority so it never preempts a real ISR.</p>
+
+<pre><code>                  xTaskCreate()
+                        |
+                        v
+                   +---------+   vTaskSuspend()   +-----------+
+                   |  Ready  |&lt;------------------&gt;| Suspended |
+                   +---------+   vTaskResume()    +-----------+
+                     |     ^
+        scheduler    |     |  event arrives / timeout expires
+        picks it     v     |
+                   +---------+
+                   | Running |
+                   +---------+
+                     |     |
+       blocks        |     | vTaskDelete(NULL)
+                     v     v
+                 +---------+      Deleted
+                 | Blocked |
+                 +---------+</code></pre>
+
+<div class="callout">
+  <span class="label">Priority convention</span>
+  <p>In FreeRTOS a <strong>numerically higher</strong> priority is <strong>more urgent</strong>, and priority 0 belongs to the idle task. This is the opposite of ARM NVIC interrupt priorities, where a lower number preempts. Mixing the two conventions up is the most common first-week bug.</p>
+</div>
+
+<h2>What FreeRTOS is not</h2>
+
+<ul>
+  <li>No processes, no MMU isolation by default, no protection between tasks. A bad pointer in one task corrupts another. MPU ports exist, but they are a deliberate design choice.</li>
+  <li>No file system, TCP/IP stack, USB stack or CLI in the kernel. <code>FreeRTOS-Plus-TCP</code>, <code>coreMQTT</code> and <code>littlefs</code> are libraries that <em>use</em> the kernel.</li>
+  <li>Not a hard real-time guarantee by itself. The kernel gives you the mechanism; your interrupt priorities, critical sections and allocation strategy decide whether you get the guarantee.</li>
+</ul>
+
+<h2>Where the code lives</h2>
+
+<pre><code>FreeRTOS-Kernel/
+  tasks.c  queue.c  list.c  timers.c  event_groups.c  stream_buffer.c
+  include/                  FreeRTOS.h, task.h, queue.h, semphr.h, timers.h
+  portable/
+    MemMang/heap_1.c ... heap_5.c
+    GCC/ARM_CM4F/           port.c, portmacro.h  (Cortex-M4F)
+    GCC/ARM_CM33_NTZ/       Cortex-M33
+    ThirdParty/GCC/Posix/   host simulation</code></pre>
+
+<p>A project adds exactly <strong>three</strong> things: the core <code>.c</code> files, one port directory, and one heap implementation. Knowing that makes “undefined reference to <code>xQueueGenericSend</code>” and “<code>vPortSVCHandler</code> multiply defined” trivial to diagnose.</p>
+
+<h2>Five-minute lab</h2>
+
+<ol class="steps">
+  <li><strong>Read your current project's main loop.</strong> Write down the worst-case time from “UART byte arrives” to “byte is processed”. That number is your baseline.</li>
+  <li><strong>List the independent activities</strong> in the loop and their periods. If two of them have no reason to be in the same loop, they are your first two tasks.</li>
+  <li><strong>Name the deadline of each.</strong> Not the period — the deadline. That list becomes the priority order in Module 4.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>An RTOS buys you concurrency <em>and</em> blocking, so that response time can be reasoned about per activity. If you cannot name the deadline of a task, you are not ready to give it a priority.</p>
+</div>

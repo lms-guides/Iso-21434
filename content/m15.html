@@ -1,0 +1,569 @@
+<section class="hero">
+  <p class="eyebrow">Module 15 · 90–120 minutes</p>
+  <h1>Your first project, step by step</h1>
+  <p class="lede">One board, three tasks, a queue, a debounced button, a UART console and a stats command. Every file and every command, in the order you should do them.</p>
+  <ul class="chips">
+    <li class="chip">NUCLEO-F411RE</li>
+    <li class="chip">CubeMX + CubeIDE</li>
+    <li class="chip">3 tasks</li>
+    <li class="chip">Hands-on</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Create a FreeRTOS project from an empty CubeMX project and prove the scheduler runs.</li>
+      <li>Turn a button press into a debounced event, delivered by queue to another task.</li>
+      <li>Build a UART command console and a diagnostics command you will reuse in every project.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>What you are building</h2>
+
+<p>A “button + LED console” — deliberately small, but it exercises every mechanism you will use in a real product:</p>
+
+<ul>
+  <li>An LED toggles at a configurable rate (default 500 ms).</li>
+  <li>Pressing the user button prints a timestamped line over serial, exactly once per press.</li>
+  <li>A UART console accepts <code>help</code>, <code>rate &lt;ms&gt;</code>, <code>led on|off</code> and <code>stats</code>.</li>
+  <li><code>stats</code> reports uptime, button count, the kernel heap minimum and each task's stack headroom.</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Task</th><th>Prio</th><th>Stack</th><th>Job</th><th>Blocks on</th></tr></thead>
+  <tbody>
+    <tr><td><code>hb</code></td><td>2</td><td>256 w</td><td>Toggle LED, apply rate/led commands</td><td><code>xTaskDelayUntil</code></td></tr>
+    <tr><td><code>evt</code></td><td>3</td><td>384 w</td><td>Print one line per debounced press</td><td>Event queue</td></tr>
+    <tr><td><code>cli</code></td><td>1</td><td>512 w</td><td>Echo, parse and dispatch commands</td><td>Stream buffer</td></tr>
+    <tr><td>timer svc</td><td>6</td><td>256 w</td><td>50 ms debounce one-shot</td><td>Timer queue</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Signal</th><th>Pin</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>LED LD2</td><td>PA5</td><td>Active high, on-board</td></tr>
+    <tr><td>Button B1</td><td>PC13</td><td>Active low, internal pull-up, EXTI falling edge</td></tr>
+    <tr><td>Serial (VCP)</td><td>USART2 PA2/PA3</td><td>115200 8N1 through the ST-Link USB port</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Final behaviour, at the other end of the USB cable:</p>
+
+<pre><code>RTOS lab ready. Type 'help'.
+&gt; help
+commands: help | rate &lt;ms&gt; | led on|off | stats
+&gt; rate 200
+rate set to 200 ms
+&gt; stats
+uptime   : 42 s
+buttons  : 3
+heap min : 11240 bytes
+stack hb : 214 words free
+stack evt: 331 words free
+stack cli: 402 words free
+&gt; [12345 ms] button pressed (#4)</code></pre>
+
+<div class="callout">
+  <span class="label">No board?</span>
+  <p>Do Steps 1 and 3–8 on the POSIX port from Module 2 instead: replace the GPIO calls with <code>printf</code> and drive the “button” from a small producer task. The kernel code — tasks, queue, timer, stream buffer, mutex — is identical, which is exactly the point.</p>
+</div>
+
+<h2>Before you start</h2>
+
+<ul>
+  <li>NUCLEO-F411RE (or any Nucleo-64; adjust pins if yours differs) and a micro-USB cable that carries data.</li>
+  <li>STM32CubeMX and STM32CubeIDE installed, with the STM32CubeF4 package downloaded.</li>
+  <li>A serial terminal: PuTTY, <code>screen</code>, or <code>python3 -m serial.tools.miniterm /dev/ttyACM0 115200</code>.</li>
+  <li>45 minutes for Steps 1–3, then the rest in a second sitting.</li>
+</ul>
+
+<h2>Step 1 — Prove the board works, bare metal</h2>
+
+<p>Never add an RTOS to a board you have not blinked. This isolates wiring and toolchain problems from kernel problems.</p>
+
+<ol class="steps">
+  <li><strong>New project</strong> in CubeMX → Board Selector → NUCLEO-F411RE → Start Project.</li>
+  <li><strong>Clock</strong>: leave the default HSI at 16 MHz for now. It is accurate enough for 115200 baud and removes the clock-tree step from your first session.</li>
+  <li><strong>SYS → Debug: Serial Wire.</strong> Keep the HAL timebase on SysTick for this bare-metal step; you will move it in Step 2.</li>
+  <li><strong>PA5</strong>: GPIO_Output, user label <code>LED</code>, default low.</li>
+  <li><strong>PC13</strong>: GPIO_EXTI13, pull-up, falling edge, user label <code>BTN</code>.</li>
+  <li><strong>USART2</strong>: Asynchronous, 115200 8N1. Pins PA2/PA3 are already assigned by the board.</li>
+  <li><strong>Project Manager</strong>: name <code>rtos-lab</code>, Toolchain CubeIDE (or Makefile/CMake), “generate peripheral initialization as a pair of .c/.h files”.</li>
+  <li><strong>Generate Code</strong>, open the project, and put this in <code>while (1)</code>:</li>
+</ol>
+
+<pre><code>HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+HAL_Delay(500);</code></pre>
+
+<p>Build (Ctrl+B in CubeIDE), flash (Run), and confirm the LED blinks at 1 Hz. If it does not, stop here and fix that first — check the board's user manual for the correct LED pin if your board is not an F411RE.</p>
+
+<div class="callout warn">
+  <span class="label">Checkpoint 1</span>
+  <p>LED blinking, no errors, and you know which COM port the ST-Link enumerated. Do not continue until this is true.</p>
+</div>
+
+<h2>Step 2 — Add the kernel and one task</h2>
+
+<p>Go back to CubeMX and enable the middleware:</p>
+
+<ol class="steps">
+  <li><strong>Middleware → FREERTOS → Interface: CMSIS_V2.</strong> This is only to get the kernel integrated and configured by the tool; all code you write next uses the native API.</li>
+  <li><strong>Config parameters</strong>, then set the values in the table below.</li>
+  <li><strong>NVIC</strong>: enable <code>USART2 global interrupt</code> and <code>EXTI line[15:10] interrupts</code>, both with preemption priority <strong>6</strong>, subpriority 0.</li>
+  <li><strong>Generate Code.</strong> CubeMX will offer to move the HAL timebase to TIM6 — accept, because SysTick now belongs to FreeRTOS.</li>
+</ol>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>configTICK_RATE_HZ</code></td><td>1000</td><td>1 ms resolution, the default from Module 5</td></tr>
+    <tr><td><code>configMAX_PRIORITIES</code></td><td>7</td><td>Enough levels, still cheap</td></tr>
+    <tr><td><code>configMINIMAL_STACK_SIZE</code></td><td>128</td><td>Words, for the idle/timer tasks</td></tr>
+    <tr><td><code>configTOTAL_HEAP_SIZE</code></td><td>16384</td><td>Bytes; three tasks plus objects fit with room</td></tr>
+    <tr><td><code>configUSE_TIMERS</code></td><td>Enabled, queue 10, stack 256</td><td>Debounce timer and a future watchdog</td></tr>
+    <tr><td><code>configCHECK_FOR_STACK_OVERFLOW</code></td><td>2</td><td>Catches the stack bug you will actually have</td></tr>
+    <tr><td><code>configUSE_MALLOC_FAILED_HOOK</code></td><td>Enabled</td><td>Names the failure instead of hanging</td></tr>
+    <tr><td><code>configUSE_MUTEXES</code></td><td>Enabled</td><td>Protects the shared UART in <code>app_print</code></td></tr>
+    <tr><td><code>INCLUDE_uxTaskGetStackHighWaterMark</code></td><td>Enabled</td><td>The <code>stats</code> command needs it</td></tr>
+    <tr><td><code>configASSERT</code></td><td><code>if ((x)==0){ taskDISABLE_INTERRUPTS(); for(;;); }</code></td><td>Turns bad handles into an immediate, findable stop</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Now remove the generated demo task so it does not compete with yours: in <code>Core/Src/freertos.c</code>, delete the <code>defaultTask</code> handle, its function and its <code>osThreadNew(...)</code> call, then call your own entry point inside <code>MX_FREERTOS_Init()</code>:</p>
+
+<pre><code>void MX_FREERTOS_Init(void)
+{
+  /* USER CODE BEGIN RTOS_THREADS */
+  app_init();          /* creates our queues, timer and tasks */
+  /* USER CODE END RTOS_THREADS */
+}</code></pre>
+
+<p>Create <code>Core/Inc/app.h</code> and <code>Core/Src/app.c</code>, and make sure <code>app.c</code> is in the build (CubeIDE adds <code>Core/Src</code> automatically; with Makefile/CMake add the file to the source list).</p>
+
+<pre><code>/* app.h */
+#ifndef APP_H
+#define APP_H
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "timers.h"
+#include "semphr.h"
+#include "stream_buffer.h"
+
+void app_init(void);
+void app_print(const char *fmt, ...);
+
+#endif</code></pre>
+
+<p>Start with just the heartbeat task and a print helper. Add this to <code>app.c</code>:</p>
+
+<pre><code>#include "app.h"
+#include "main.h"
+#include &lt;stdio.h&gt;
+#include &lt;stdarg.h&gt;
+
+static SemaphoreHandle_t xPrintMutex;
+
+void app_print(const char *fmt, ...)
+{
+    char buf[128];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+
+    if (n &lt;= 0) return;
+    if (n &gt;= (int)sizeof buf) n = sizeof buf - 1;
+
+    if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        HAL_UART_Transmit(&amp;huart2, (uint8_t *)buf, (uint16_t)n, 100);
+        xSemaphoreGive(xPrintMutex);
+    }
+}
+
+static void vHeartbeatTask(void *pv)
+{
+    TickType_t xLast = xTaskGetTickCount();
+    (void)pv;
+
+    for (;;) {
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+        xTaskDelayUntil(&amp;xLast, pdMS_TO_TICKS(500));
+    }
+}
+
+void app_init(void)
+{
+    xPrintMutex = xSemaphoreCreateMutex();
+    configASSERT(xPrintMutex != NULL);
+
+    xTaskCreate(vHeartbeatTask, "hb", 256, NULL, 2, NULL);
+}</code></pre>
+
+<div class="callout warn">
+  <span class="label">Checkpoint 2</span>
+  <p>Build, flash, and confirm the LED blinks at exactly 500 ms. If it blinks once and stops, the scheduler did not start or the heap was too small — see the troubleshooting table at the end.</p>
+</div>
+
+<h2>Step 3 — Button press → debounce timer → queue → event task</h2>
+
+<p>A mechanical button bounces for a few milliseconds. Do not debounce in the ISR with a delay; start a one-shot timer, and let the timer callback decide whether the button is still down.</p>
+
+<pre><code>typedef struct {
+    uint32_t ulTick;
+} event_t;
+
+static QueueHandle_t xEventQueue;
+static TimerHandle_t xDebounceTimer;
+static TaskHandle_t  xEventHandle;
+
+static volatile uint32_t ulButtonCount;
+static volatile uint32_t ulEventDrops;
+
+/* 50 ms one-shot, runs in the timer daemon task */
+static void vDebounceCallback(TimerHandle_t xTimer)
+{
+    event_t ev;
+
+    (void)xTimer;
+
+    if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_RESET) {
+        ev.ulTick = xTaskGetTickCount();
+        if (xQueueSend(xEventQueue, &amp;ev, 0) != pdPASS) {
+            ulEventDrops++;
+        }
+    }
+}
+
+/* EXTI ISR: restart the timer, do nothing else */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    BaseType_t xWoken = pdFALSE;
+
+    if (GPIO_Pin == BTN_Pin) {
+        xTimerStartFromISR(xDebounceTimer, &amp;xWoken);
+    }
+    portYIELD_FROM_ISR(xWoken);
+}
+
+static void vEventTask(void *pv)
+{
+    event_t ev;
+    (void)pv;
+
+    for (;;) {
+        if (xQueueReceive(xEventQueue, &amp;ev, portMAX_DELAY) == pdPASS) {
+            ulButtonCount++;
+            app_print("[%lu ms] button pressed (#%lu)\r\n",
+                      (unsigned long)ev.ulTick,
+                      (unsigned long)ulButtonCount);
+        }
+    }
+}</code></pre>
+
+<p>Extend <code>app_init()</code>:</p>
+
+<pre><code>xEventQueue   = xQueueCreate(16, sizeof(event_t));
+xDebounceTimer = xTimerCreate("deb", pdMS_TO_TICKS(50), pdFALSE, NULL,
+                              vDebounceCallback);
+
+configASSERT(xEventQueue != NULL);
+configASSERT(xDebounceTimer != NULL);
+
+xTaskCreate(vEventTask, "evt", 384, NULL, 3, &amp;xEventHandle);</code></pre>
+
+<p>Why this shape works:</p>
+
+<ul>
+  <li><strong>The ISR is three lines</strong> and touches no hardware state beyond starting a timer.</li>
+  <li><strong>The timer callback runs in a task</strong>, so it may read a pin and post to a queue — an ISR should not.</li>
+  <li><strong>Every bounce restarts the 50 ms window</strong>, so only the final, stable edge produces an event.</li>
+  <li><strong>Exactly one task owns the counter</strong>, so no lock is needed on <code>ulButtonCount</code>.</li>
+</ul>
+
+<div class="callout warn">
+  <span class="label">Checkpoint 3</span>
+  <p>One line per press, none for a light tap-and-hold. If you get two or three lines, raise the debounce to 80 ms and check whether your board has a hardware debounce capacitor.</p>
+</div>
+
+<h2>Step 4 — UART console: interrupt → stream buffer → CLI task</h2>
+
+<p>Bytes arrive unpredictably and lines need parsing, so the ISR should only move bytes and the task should do the thinking.</p>
+
+<pre><code>static StreamBufferHandle_t xCliRx;
+static TaskHandle_t xCliHandle;
+static uint8_t ucRxByte;
+
+/* Called from the UART ISR context */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    BaseType_t xWoken = pdFALSE;
+    uint8_t b;
+
+    if (huart-&gt;Instance != USART2) return;
+
+    b = ucRxByte;
+    HAL_UART_Receive_IT(&amp;huart2, &amp;ucRxByte, 1);   /* re-arm first */
+    xStreamBufferSendFromISR(xCliRx, &amp;b, 1, &amp;xWoken);
+    portYIELD_FROM_ISR(xWoken);
+}</code></pre>
+
+<pre><code>static void vCliTask(void *pv)
+{
+    char line[64];
+    size_t len = 0;
+    uint8_t ch;
+    bool lastCR = false;
+
+    (void)pv;
+    app_print("\r\nRTOS lab ready. Type 'help'.\r\n&gt; ");
+
+    for (;;) {
+        if (xStreamBufferReceive(xCliRx, &amp;ch, 1, portMAX_DELAY) != 1) {
+            continue;
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            if (ch == '\n' &amp;&amp; lastCR) { lastCR = false; continue; }
+            lastCR = (ch == '\r');
+
+            if (len &gt; 0) {
+                line[len] = '\0';
+                app_print("\r\n");
+                cli_exec(line);
+                len = 0;
+                app_print("&gt; ");
+            }
+            continue;
+        }
+        lastCR = false;
+
+        if (ch == 0x7F || ch == '\b') {
+            if (len &gt; 0) { len--; app_print("\b \b"); }
+        } else if (len &lt; sizeof line - 1) {
+            line[len++] = (char)ch;
+            app_print("%c", ch);          /* local echo */
+        }
+    }
+}</code></pre>
+
+<p>Add to <code>app_init()</code>, after creating the stream buffer, and remember to arm the first receive:</p>
+
+<pre><code>xCliRx = xStreamBufferCreate(128, 1);
+configASSERT(xCliRx != NULL);
+xTaskCreate(vCliTask, "cli", 512, NULL, 1, &amp;xCliHandle);
+
+HAL_UART_Receive_IT(&amp;huart2, &amp;ucRxByte, 1);</code></pre>
+
+<div class="callout">
+  <span class="label">Why a mutex around printing?</span>
+  <p>Three tasks write to one UART. A mutex keeps whole lines from interleaving. It also means a print holds the lock for the duration of the transfer — at 115200, a 100-character line is about 9 ms. That is acceptable here; Module 14's checklist asks you to move TX to its own task for a product.</p>
+</div>
+
+<h2>Step 5 — Commands: change the blink rate at runtime</h2>
+
+<p>Commands travel as values through a queue, so the heartbeat task owns its own period and nobody mutates it from another context.</p>
+
+<pre><code>typedef enum {
+    CMD_RATE = 1,
+    CMD_LED
+} cmd_id_t;
+
+typedef struct {
+    cmd_id_t id;
+    uint32_t arg;
+} command_t;
+
+static QueueHandle_t xCmdQueue;
+
+/* Owned by the heartbeat task only */
+static TickType_t xBlinkPeriod = pdMS_TO_TICKS(500);
+static bool bBlinkEnabled = true;
+
+static void handle_command(const command_t *cmd)
+{
+    if (cmd-&gt;id == CMD_RATE) {
+        xBlinkPeriod = pdMS_TO_TICKS(cmd-&gt;arg);
+        app_print("rate set to %lu ms\r\n", (unsigned long)cmd-&gt;arg);
+    } else if (cmd-&gt;id == CMD_LED) {
+        bBlinkEnabled = (cmd-&gt;arg != 0);
+        if (!bBlinkEnabled) {
+            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+        }
+        app_print("led %s\r\n", bBlinkEnabled ? "on" : "off");
+    }
+}
+
+static void vHeartbeatTask(void *pv)
+{
+    command_t cmd;
+    TickType_t xLast = xTaskGetTickCount();
+    (void)pv;
+
+    for (;;) {
+        while (xQueueReceive(xCmdQueue, &amp;cmd, 0) == pdPASS) {
+            handle_command(&amp;cmd);
+        }
+
+        if (bBlinkEnabled) {
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+        }
+
+        xTaskDelayUntil(&amp;xLast, xBlinkPeriod);
+    }
+}</code></pre>
+
+<pre><code>static void cli_exec(char *line)
+{
+    if (strcmp(line, "help") == 0) {
+        app_print("commands: help | rate &lt;ms&gt; | led on|off | stats\r\n");
+    } else if (strncmp(line, "rate ", 5) == 0) {
+        char *end = NULL;
+        unsigned long v = strtoul(line + 5, &amp;end, 10);
+
+        if (end == line + 5 || *end != '\0' || v &lt; 50 || v &gt; 5000) {
+            app_print("usage: rate &lt;50..5000&gt;\r\n");
+            return;
+        }
+        command_t cmd = { CMD_RATE, (uint32_t)v };
+        if (xQueueSend(xCmdQueue, &amp;cmd, pdMS_TO_TICKS(10)) != pdPASS) {
+            app_print("command queue full\r\n");
+        }
+    } else if (strcmp(line, "led on") == 0 || strcmp(line, "led off") == 0) {
+        command_t cmd = { CMD_LED, (uint32_t)(line[4] == 'o' &amp;&amp; line[5] == 'n') };
+        (void)xQueueSend(xCmdQueue, &amp;cmd, pdMS_TO_TICKS(10));
+    } else if (strcmp(line, "stats") == 0) {
+        print_stats();
+    } else if (line[0] != '\0') {
+        app_print("unknown command: %s\r\n", line);
+    }
+}</code></pre>
+
+<p>Create the queue in <code>app_init()</code> before the heartbeat task, and add the headers <code>&lt;string.h&gt;</code> and <code>&lt;stdlib.h&gt;</code> to <code>app.c</code>.</p>
+
+<div class="callout warn">
+  <span class="label">Checkpoint 5</span>
+  <p><code>rate 200</code> changes the blink within one old period; <code>rate 10</code> is rejected with the usage line; <code>led off</code> stops toggling and leaves the LED dark. Note that the command is acknowledged by the heartbeat task, not the CLI task — that is the ownership paying off.</p>
+</div>
+
+<h2>Step 6 — A <code>stats</code> command you will keep forever</h2>
+
+<pre><code>static TaskHandle_t xHeartbeatHandle;
+
+static void print_stats(void)
+{
+    app_print("uptime   : %lu s\r\n",
+              (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ));
+    app_print("buttons  : %lu\r\n", (unsigned long)ulButtonCount);
+    app_print("drops    : %lu\r\n", (unsigned long)ulEventDrops);
+    app_print("heap min : %u bytes\r\n",
+              (unsigned)xPortGetMinimumEverFreeHeapSize());
+    app_print("stack hb : %u words free\r\n",
+              (unsigned)uxTaskGetStackHighWaterMark(xHeartbeatHandle));
+    app_print("stack evt: %u words free\r\n",
+              (unsigned)uxTaskGetStackHighWaterMark(xEventHandle));
+    app_print("stack cli: %u words free\r\n",
+              (unsigned)uxTaskGetStackHighWaterMark(xCliHandle));
+}</code></pre>
+
+<p>Pass <code>&amp;xHeartbeatHandle</code> as the last argument of <code>xTaskCreate</code> for the heartbeat task. Then leave the board running for ten minutes, press the button a few dozen times, and run <code>stats</code> again. Any number that moved towards zero is a bug you just found before a customer did.</p>
+
+<h2>Step 7 — The three files you actually touched</h2>
+
+<pre><code>Core/Inc/app.h            prototypes and kernel includes
+Core/Src/app.c            app_print, ISR hooks, three tasks, queue, timer
+Core/Src/freertos.c       app_init() inside MX_FREERTOS_Init()
+Core/Inc/FreeRTOSConfig.h the table of settings from Step 2</code></pre>
+
+<p>Order the functions in <code>app.c</code> like this, so the file reads top-down:</p>
+
+<pre><code>1. includes
+2. handles and shared state (queues, timer, stream buffer, mutex, handles)
+3. app_print()
+4. vDebounceCallback()
+5. HAL_GPIO_EXTI_Callback()
+6. HAL_UART_RxCpltCallback()
+7. handle_command() and the heartbeat task
+8. vEventTask()
+9. print_stats() and cli_exec()
+10. vCliTask()
+11. app_init()   &lt;-- last, so every function it references is already defined</code></pre>
+
+<p>Build, flash, open the serial terminal, and run the script below.</p>
+
+<h2>Step 8 — Test it like a product, not a demo</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Action</th><th>Expected</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Power on, open serial at 115200</td><td>Banner and <code>&gt;</code> prompt within one second</td></tr>
+    <tr><td>2</td><td>Watch the LED</td><td>Toggles every 500 ms, no drift over 60 s</td></tr>
+    <tr><td>3</td><td>Press the button once</td><td>Exactly one timestamped line with an incrementing count</td></tr>
+    <tr><td>4</td><td><code>rate 200</code></td><td>Ack line, LED period becomes 200 ms</td></tr>
+    <tr><td>5</td><td><code>rate 10</code></td><td>Usage line, period unchanged</td></tr>
+    <tr><td>6</td><td><code>led off</code> / <code>led on</code></td><td>LED stops / resumes, acknowledgements in order</td></tr>
+    <tr><td>7</td><td><code>stats</code> after 10 minutes</td><td>Heap minimum well above zero, every stack above 30 words free</td></tr>
+    <tr><td>8</td><td>Press 20 times quickly</td><td>20 lines, <code>drops</code> stays 0</td></tr>
+    <tr><td>9</td><td>Unplug/replug USB</td><td>Clean reboot, banner again, counts reset</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>If all nine pass, you have a working RTOS project — not a blink demo. That is the threshold this course was aiming at.</p>
+
+<h2>Step 9 — Troubleshooting</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>No serial output at all</td><td>Wrong COM port, or USART2 IRQ disabled, or <code>HAL_UART_Receive_IT</code> never armed</td><td>Loopback-test the terminal, enable the IRQ in NVIC, arm the first receive in <code>app_init</code></td></tr>
+    <tr><td>Garbage characters</td><td>Baud/clock mismatch, or HSI vs HSE confusion</td><td>Confirm 115200 and that the clock tree matches your config</td></tr>
+    <tr><td>LED blinks once, then nothing</td><td>Scheduler returned (heap too small) or the generated default task was left running</td><td>Raise <code>configTOTAL_HEAP_SIZE</code>, delete <code>defaultTask</code>, check the malloc hook</td></tr>
+    <tr><td>HardFault on first button press</td><td>EXTI priority more urgent than the syscall ceiling, calling <code>xTimerStartFromISR</code></td><td>Set EXTI preemption priority to 6 (ceiling is 5)</td></tr>
+    <tr><td>Two or three lines per press</td><td>Debounce too short for your switch</td><td>Increase the one-shot to 80–100 ms</td></tr>
+    <tr><td>Console freezes during a print burst</td><td>Print mutex held, or <code>app_print</code> called from a timer callback</td><td>Never print from an ISR or timer callback; move TX to a task</td></tr>
+    <tr><td>Prompt appears twice per Enter</td><td>Both <code>\r</code> and <code>\n</code> treated as line ends</td><td>The <code>lastCR</code> flag in <code>vCliTask</code> handles this — check it survived your edits</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Step 10 — Make it yours</h2>
+
+<p>Pick one and only one. Each is a 30–60 minute extension that adds a new mechanism rather than more of the same:</p>
+
+<ol class="steps">
+  <li><strong>Second button, counting semaphore.</strong> Add a “mode” button; the ISR gives a counting semaphore, and a task consumes one mode change per press.</li>
+  <li><strong>Replace the polled command queue.</strong> Have the CLI task notify the heartbeat task instead of the heartbeat polling with a zero timeout. Compare CPU time in <code>stats</code>.</li>
+  <li><strong>ADC task.</strong> Sample one channel at 1 kHz with DMA, send samples through a queue, and print a 10-sample average once per second.</li>
+  <li><strong>Tickless idle.</strong> Enable <code>configUSE_TICKLESS_IDLE</code>, measure current in run and idle, and explain the difference.</li>
+  <li><strong>Health task and watchdog.</strong> Add the heartbeat counters and IWDG refresh from Module 13, then block the CLI task on purpose and watch the reset.</li>
+  <li><strong>Console TX task.</strong> Move all UART output into one task fed by a queue, removing the 9 ms mutex hold from every caller.</li>
+</ol>
+
+<h2>What you just proved</h2>
+
+<ul>
+  <li><strong>Module 4:</strong> tasks with different priorities, and a periodic task that does not drift.</li>
+  <li><strong>Module 6:</strong> a queue that carries events between an ISR-driven producer and a consumer.</li>
+  <li><strong>Module 7:</strong> a mutex protecting a shared peripheral, with a timeout.</li>
+  <li><strong>Module 8:</strong> a stream buffer for bytes and a queue for commands.</li>
+  <li><strong>Module 9:</strong> an ISR that starts a timer and returns in microseconds.</li>
+  <li><strong>Module 10:</strong> measured stack and heap margins instead of guesses.</li>
+</ul>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>The project is small on purpose: ownership is obvious, every wait is bounded, and the diagnostics are built in from day one. Scale that shape up, not the number of tasks.</p>
+</div>

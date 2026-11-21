@@ -1,0 +1,131 @@
+<section class="hero">
+  <p class="eyebrow">Module 07 · 35 minutes</p>
+  <h1>Semaphores, mutexes and priority inversion</h1>
+  <p class="lede">Signalling and mutual exclusion are different problems with different objects. Using the wrong one produces bugs that only appear under load.</p>
+  <ul class="chips">
+    <li class="chip">Binary semaphore</li>
+    <li class="chip">Mutex</li>
+    <li class="chip">Priority inversion</li>
+    <li class="chip">Critical section</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Pick between binary, counting, mutex and recursive mutex.</li>
+      <li>Reproduce priority inversion and explain how inheritance bounds it.</li>
+      <li>Keep critical sections short and mutex holds shorter.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Four objects that look alike</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Object</th><th>Created with</th><th>Use for</th><th>From ISR</th></tr></thead>
+  <tbody>
+    <tr><td>Binary semaphore</td><td><code>xSemaphoreCreateBinary()</code></td><td>Signal one event; starts <strong>empty</strong></td><td><code>xSemaphoreGiveFromISR</code></td></tr>
+    <tr><td>Counting semaphore</td><td><code>xSemaphoreCreateCounting(max, initial)</code></td><td>Count events or manage N resources</td><td><code>xSemaphoreGiveFromISR</code></td></tr>
+    <tr><td>Mutex</td><td><code>xSemaphoreCreateMutex()</code></td><td>Mutual exclusion with priority inheritance; starts <strong>available</strong></td><td><strong>never</strong></td></tr>
+    <tr><td>Recursive mutex</td><td><code>xSemaphoreCreateRecursiveMutex()</code></td><td>A lock taken by nested functions in one task</td><td><strong>never</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>A binary semaphore starts empty, so the first take blocks until someone gives. A mutex starts available, so the first take succeeds. Swapping them produces “my task blocks forever at startup” or “the lock protects nothing”.</p>
+
+<h2>The deferred-interrupt pattern</h2>
+
+<p>This is the most important pattern in embedded FreeRTOS: <strong>do almost nothing in the ISR; signal a task that does the work.</strong></p>
+
+<pre><code>static SemaphoreHandle_t xAdcReadySem;
+
+void ADC_IRQHandler(void)
+{
+    BaseType_t xWoken = pdFALSE;
+
+    adc_clear_irq();                                   /* source first */
+    xSemaphoreGiveFromISR(xAdcReadySem, &amp;xWoken);
+    portYIELD_FROM_ISR(xWoken);
+}
+
+static void vAdcTask(void *pv)
+{
+    (void)pv;
+    for (;;) {
+        if (xSemaphoreTake(xAdcReadySem, portMAX_DELAY) == pdTRUE) {
+            process_adc_samples();          /* may block or take 2 ms */
+        }
+    }
+}</code></pre>
+
+<p>Use a binary semaphore when coalescing is acceptable (“something happened”). Use a counting semaphore or a queue when every event must be counted individually.</p>
+
+<h2>Priority inversion, concretely</h2>
+
+<p>The canonical failure:</p>
+
+<ol class="steps">
+  <li>Low-priority task <strong>L</strong> takes mutex M.</li>
+  <li>High-priority task <strong>H</strong> becomes ready and blocks on M.</li>
+  <li>Medium-priority task <strong>M</strong> becomes ready and preempts L — it never touches the lock.</li>
+  <li>H is now effectively waiting for a medium-priority task. If M runs long, H misses its deadline.</li>
+</ol>
+
+<p>FreeRTOS mutexes implement <strong>priority inheritance</strong>: while H is blocked on M, L temporarily runs at H's priority, so the medium task cannot preempt it. Inheritance does not fix a bad design; it bounds the damage. The Mars Pathfinder case study is the classic account of why this matters in production.</p>
+
+<pre><code>static SemaphoreHandle_t xI2cBusMutex;
+
+static bool i2c_read_reg(uint8_t dev, uint8_t reg, uint8_t *out)
+{
+    bool ok = false;
+
+    if (xSemaphoreTake(xI2cBusMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        ok = hal_i2c_read(dev, reg, out, 1);
+        xSemaphoreGive(xI2cBusMutex);
+    }
+    return ok;                       /* false = timeout, report it */
+}</code></pre>
+
+<p>Rules for mutexes:</p>
+
+<ul>
+  <li><strong>Always use a timeout</strong> in production, so a deadlock is a reported error instead of a hung product.</li>
+  <li><strong>Hold for the shortest possible time.</strong> No <code>vTaskDelay</code>, <code>printf</code>, flash writes or blocking I/O while holding a lock.</li>
+  <li><strong>Establish a lock order</strong> when a task needs two mutexes (for example bus-then-state), and write it down. Unordered locking is how deadlocks happen.</li>
+  <li><strong>Never take a mutex in an ISR</strong> — it can block.</li>
+  <li><strong>Prefer one owner per piece of data</strong> (Module 11), which removes most mutexes entirely.</li>
+</ul>
+
+<h2>Critical sections vs mutexes</h2>
+
+<pre><code>taskENTER_CRITICAL();
+ulSharedCounter++;
+taskEXIT_CRITICAL();
+
+/* In an ISR, if you truly must: */
+UBaseType_t xSaved = taskENTER_CRITICAL_FROM_ISR();
+ulSharedCounter++;
+taskEXIT_CRITICAL_FROM_ISR(xSaved);</code></pre>
+
+<p>A critical section stops preemption and masks interrupts up to the syscall ceiling. It never blocks, so it cannot deadlock — but every microsecond inside it is added to the worst-case interrupt latency of the whole system. Keep them to a handful of instructions.</p>
+
+<p>A mutex blocks other tasks but leaves interrupts running. Use it around longer operations and shared peripherals.</p>
+
+<h2>The gatekeeper pattern</h2>
+
+<p>When one resource — an SPI bus with three devices, an SD card, a display — is used by many tasks and each access is long, give the resource its <strong>own task</strong> and let clients send requests through a queue and wait on a reply queue. No mutex is needed: accesses are serialized by construction, and retries, timeouts and error handling live in one place. The cost is one stack and one context switch per request.</p>
+
+<h2>Lab: reproduce inversion, then fix it</h2>
+
+<ol class="steps">
+  <li>Three tasks: L (prio 1) takes a mutex then busy-waits 50 ms; M (prio 3) busy-waits 100 ms; H (prio 5) takes the same mutex and toggles a pin.</li>
+  <li>Start L, then M, then H. Measure H's wait: about 150 ms.</li>
+  <li>Replace the mutex with a binary semaphore used as a lock. Re-measure — inheritance is gone and M can starve H arbitrarily.</li>
+  <li>Restore the mutex. H's wait drops to about 50 ms.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>Semaphores signal, mutexes protect. If the object is held across a long operation, redesign the ownership instead of lengthening the lock.</p>
+</div>

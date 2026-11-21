@@ -1,0 +1,245 @@
+<section class="hero">
+  <p class="eyebrow">Module 13 · 60 minutes</p>
+  <h1>Capstone: build a sensor data logger</h1>
+  <p class="lede">Everything from Modules 1–12, in one product: sampling, processing, storage, a command line, health supervision and a watchdog.</p>
+  <ul class="chips">
+    <li class="chip">Project</li>
+    <li class="chip">Task table</li>
+    <li class="chip">CLI</li>
+    <li class="chip">Watchdog</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Turn a one-page specification into a task table and module layout.</li>
+      <li>Implement sampling, processing, storage, CLI and health tasks.</li>
+      <li>Bring the system up in seven verifiable milestones.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Specification</h2>
+
+<ul>
+  <li>Read temperature and humidity at <strong>100 Hz</strong> over I2C.</li>
+  <li>Apply a moving-average filter; flag samples that cross configurable thresholds.</li>
+  <li>Write samples to SD card in <strong>1-second batches</strong>, tolerating a 200 ms card stall without losing samples.</li>
+  <li>Provide a UART command line: <code>status</code>, <code>rate &lt;hz&gt;</code>, <code>threshold &lt;t&gt;</code>, <code>dump</code>.</li>
+  <li>Blink a status LED: 1 Hz healthy, 5 Hz fault.</li>
+  <li>Detect a stalled task within 2 s, log it, and reset if it does not recover.</li>
+  <li>Run on a Cortex-M4 with 128 KB RAM and a 1 kHz tick.</li>
+</ul>
+
+<h2>Task table</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Task</th><th>Prio</th><th>Trigger</th><th>Stack</th><th>Owns / does</th></tr></thead>
+  <tbody>
+    <tr><td><code>health</code></td><td>5</td><td>1 s timer</td><td>256 w</td><td>Heartbeats, stack watermarks, watchdog, fault flags</td></tr>
+    <tr><td><code>sensor</code></td><td>4</td><td>10 ms delay-until</td><td>384 w</td><td>I2C device, sample queue producer</td></tr>
+    <tr><td><code>process</code></td><td>3</td><td>sample queue</td><td>512 w</td><td>Filter, thresholds, storage queue producer</td></tr>
+    <tr><td><code>storage</code></td><td>2</td><td>batch or 1 s</td><td>768 w</td><td>SD card, file lifecycle, flush on command</td></tr>
+    <tr><td><code>cli</code></td><td>2</td><td>UART stream</td><td>512 w</td><td>UART RX/TX, command parsing, replies</td></tr>
+    <tr><td>timer svc</td><td>7</td><td>kernel</td><td>256 w</td><td>LED pattern, 2 s fault timeout</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Check the numbers before writing code. <code>sensor</code> needs 1.2 ms every 10 ms (12%), <code>process</code> 0.4 ms (4%), <code>storage</code> 80 ms per second (8%), and the rest is under 2%. Total under 30%, leaving plenty for ISRs and the tick. The queue from <code>sensor</code> to <code>process</code> needs at least <code>100 Hz × 0.2 s = 20</code> slots if <code>process</code> can be delayed by storage; use 32.</p>
+
+<h2>Module layout</h2>
+
+<pre><code>app/
+  app_main.c        queues, tasks, start-up order
+  app_config.h      periods, thresholds, queue lengths
+  sensor_task.c     I2C read, timestamp, send
+  process_task.c    filter, threshold detection
+  storage_task.c    batch buffer, SD write, flush
+  cli_task.c        stream buffer, command table
+  health_task.c     heartbeats, watchdog, diagnostics
+  bsp/              GPIO, I2C, UART, SD wrappers (mockable)</code></pre>
+
+<p>Keep the BSP behind small functions (<code>bsp_i2c_read()</code>, <code>bsp_sd_write()</code>) so the logic can be tested on the host with fakes, as described in Module 12.</p>
+
+<h2>The data path</h2>
+
+<pre><code>/* app_main.c */
+QueueHandle_t xSampleQueue;   /* sensor  -&gt; process  */
+QueueHandle_t xRecordQueue;   /* process -&gt; storage  */
+QueueHandle_t xCmdQueue;      /* cli     -&gt; others   */
+StreamBufferHandle_t xCliRx;  /* UART ISR -&gt; cli     */
+
+void app_start(void)
+{
+    xSampleQueue = xQueueCreate(32, sizeof(SensorSample_t));
+    xRecordQueue = xQueueCreate(64, sizeof(Record_t));
+    xCmdQueue    = xQueueCreate(8,  sizeof(Command_t));
+    xCliRx       = xStreamBufferCreate(256, 1);
+
+    configASSERT(xSampleQueue &amp;&amp; xRecordQueue &amp;&amp; xCmdQueue &amp;&amp; xCliRx);
+
+    xTaskCreate(vHealthTask,  "health",  256, NULL, 5, NULL);
+    xTaskCreate(vSensorTask,  "sensor",  384, NULL, 4, NULL);
+    xTaskCreate(vProcessTask, "process", 512, NULL, 3, NULL);
+    xTaskCreate(vStorageTask, "storage", 768, NULL, 2, NULL);
+    xTaskCreate(vCliTask,     "cli",     512, NULL, 2, NULL);
+}</code></pre>
+
+<pre><code>/* sensor_task.c */
+static void vSensorTask(void *pv)
+{
+    SensorSample_t xSample;
+    TickType_t xLast = xTaskGetTickCount();
+    (void)pv;
+
+    for (;;) {
+        if (bsp_i2c_read_env(&amp;xSample.sTemperature, &amp;xSample.usHumidity) == 0) {
+            xSample.ulTimestamp = xTaskGetTickCount();
+            if (xQueueSend(xSampleQueue, &amp;xSample, pdMS_TO_TICKS(5)) != pdPASS) {
+                g_stats.sample_drops++;
+            }
+        } else {
+            g_stats.sensor_errors++;
+        }
+
+        g_stats.sensor_heartbeat++;
+        xTaskDelayUntil(&amp;xLast, pdMS_TO_TICKS(10));
+    }
+}</code></pre>
+
+<pre><code>/* process_task.c: filter then hand off */
+static void vProcessTask(void *pv)
+{
+    SensorSample_t xIn;
+    Record_t xOut;
+    (void)pv;
+
+    for (;;) {
+        if (xQueueReceive(xSampleQueue, &amp;xIn, portMAX_DELAY) != pdPASS) {
+            continue;
+        }
+
+        xOut.ulTimestamp = xIn.ulTimestamp;
+        xOut.sFiltered   = moving_average_update(&amp;g_filter, xIn.sTemperature);
+        xOut.ucFlags     = threshold_flags(xOut.sFiltered, g_threshold);
+
+        if (xQueueSend(xRecordQueue, &amp;xOut, pdMS_TO_TICKS(20)) != pdPASS) {
+            g_stats.record_drops++;
+        }
+        g_stats.process_heartbeat++;
+    }
+}</code></pre>
+
+<p>Note the ownership: <code>sensor</code> is the only writer of the I2C device, <code>process</code> is the only writer of the filter state, <code>storage</code> is the only writer of the SD card. No mutex is needed anywhere in this data path.</p>
+
+<h2>The command line</h2>
+
+<pre><code>/* ISR: push bytes into a stream buffer, no parsing here. */
+void USART2_IRQHandler(void)
+{
+    BaseType_t xWoken = pdFALSE;
+    uint8_t ucByte;
+
+    if (uart_rx_ready()) {
+        ucByte = uart_read_byte();
+        xStreamBufferSendFromISR(xCliRx, &amp;ucByte, 1, &amp;xWoken);
+    }
+    portYIELD_FROM_ISR(xWoken);
+}
+
+/* Task: line assembly + dispatch */
+static void vCliTask(void *pv)
+{
+    char cLine[96];
+    size_t uxLen = 0;
+    uint8_t ucByte;
+    (void)pv;
+
+    for (;;) {
+        if (xStreamBufferReceive(xCliRx, &amp;ucByte, 1, portMAX_DELAY) != 1) {
+            continue;
+        }
+
+        if (ucByte == '\r' || ucByte == '\n') {
+            if (uxLen &gt; 0) {
+                cLine[uxLen] = '\0';
+                cli_dispatch(cLine);       /* may reply via a mutexed UART */
+                uxLen = 0;
+            }
+        } else if (uxLen &lt; sizeof cLine - 1) {
+            cLine[uxLen++] = (char)ucByte;
+        } else {
+            uxLen = 0;                     /* overflow: drop the line */
+        }
+    }
+}</code></pre>
+
+<p>Replies go through one function that takes a UART mutex or, better, through a TX queue drained by a single writer. Two tasks calling <code>printf</code> on the same UART without arbitration produce interleaved, useless output.</p>
+
+<h2>Health and watchdog</h2>
+
+<pre><code>static void vHealthTask(void *pv)
+{
+    uint32_t ulLastSensor = 0, ulLastStorage = 0;
+    (void)pv;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (g_stats.sensor_heartbeat == ulLastSensor) {
+            fault_raise(FAULT_SENSOR_STALLED);
+        }
+        if (g_stats.storage_heartbeat == ulLastStorage) {
+            fault_raise(FAULT_STORAGE_STALLED);
+        }
+        ulLastSensor  = g_stats.sensor_heartbeat;
+        ulLastStorage = g_stats.storage_heartbeat;
+
+        if (fault_is_active()) {
+            led_set_pattern(PATTERN_FAST);
+            if (fault_age_ms() &gt; 2000) {
+                fault_log_dump();
+                nvic_system_reset();     /* last resort, after logging */
+            }
+        } else {
+            led_set_pattern(PATTERN_SLOW);
+            bsp_watchdog_feed();         /* only the healthy path feeds it */
+        }
+    }
+}</code></pre>
+
+<p>The watchdog is fed only when every supervised task has reported in. A single stalled task therefore leads to a reset — which is the correct outcome — but only after the fault has been named and logged.</p>
+
+<h2>Bring-up milestones</h2>
+
+<ol class="steps">
+  <li><strong>M1 — board alive.</strong> Clock, UART, LED, <code>printf</code>. No kernel yet.</li>
+  <li><strong>M2 — scheduler.</strong> Two tasks, different periods, <code>xTaskDelayUntil</code>, 1 kHz tick verified on a scope.</li>
+  <li><strong>M3 — data path.</strong> Sensor task at 100 Hz into a queue; a consumer prints rates and drops. No SD.</li>
+  <li><strong>M4 — storage.</strong> Batch 100 records, write to SD, survive a 200 ms simulated stall without losing data.</li>
+  <li><strong>M5 — CLI.</strong> <code>status</code> and <code>rate</code> work; replies never interleave with logs.</li>
+  <li><strong>M6 — health.</strong> Heartbeats, fault flags, fast/slow LED, stack watermarks in <code>status</code>.</li>
+  <li><strong>M7 — hardening.</strong> Watchdog, fault log across reset, 24-hour soak, power-cycle recovery.</li>
+</ol>
+
+<h2>Acceptance tests</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Test</th><th>Method</th><th>Pass condition</th></tr></thead>
+  <tbody>
+    <tr><td>Sample rate accuracy</td><td>Timestamp counter, 10-minute run</td><td>100 ± 0.1 Hz, no drift</td></tr>
+    <tr><td>No loss under stall</td><td>Block SD writes for 200 ms</td><td><code>sample_drops</code> stays 0</td></tr>
+    <tr><td>Sensor stall detection</td><td>Disconnect the sensor</td><td>Fault within 2 s, logged, LED fast</td></tr>
+    <tr><td>CLI responsiveness</td><td>Type during a storage burst</td><td>Reply within 100 ms</td></tr>
+    <tr><td>Stack margin</td><td><code>vTaskListTasks</code> after 24 h</td><td>Every task ≥ 30 words free</td></tr>
+    <tr><td>Heap margin</td><td>Minimum-ever-free print</td><td>≥ 25% of <code>configTOTAL_HEAP_SIZE</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>The capstone is deliberately boring: five tasks, one queue per data hand-off, one owner per resource, one supervisor. Boring is what makes it debuggable at 2 a.m.</p>
+</div>

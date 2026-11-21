@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>FreeRTOS Field Guide — a 15-module course</title>
+<meta name="description" content="A step-by-step, practical FreeRTOS course: tasks, queues, synchronization, memory, architecture, debugging, a full capstone and a hands-on first-project tutorial." />
+<meta name="theme-color" content="#0f172a" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to lesson</a>
+<div class="read-progress" aria-hidden="true"><i id="readBar"></i></div>
+
+<div class="app">
+  <div class="scrim" id="scrim" hidden></div>
+
+  <aside class="sidebar" id="sidebar" aria-label="Course navigation">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">RT</div>
+      <div class="brand-text">
+        <p class="brand-name">FreeRTOS Field Guide</p>
+        <p class="brand-sub">First task → shipped firmware</p>
+      </div>
+      <button class="icon-btn sidebar-close" id="closeBtn" aria-label="Close course navigation">
+        <span class="x" aria-hidden="true"></span>
+      </button>
+    </div>
+
+    <div class="progress-card">
+      <div class="ring" id="ring" style="--pct:0" role="img" aria-label="Course progress: 0 percent">
+        <span id="ringLabel">0%</span>
+      </div>
+      <div class="progress-copy">
+        <strong id="doneCount">0 of 15 modules</strong>
+        <span id="doneHint">Start with Module 1</span>
+      </div>
+    </div>
+
+    <label class="search" for="search">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6"></circle><path d="M14 14l4 4"></path></svg>
+      <input id="search" type="search" placeholder="Find a module…" autocomplete="off" spellcheck="false" />
+    </label>
+
+    <nav id="moduleList" class="module-list" aria-label="Modules"></nav>
+    <p class="empty-filter" id="emptyFilter" hidden>No module matches that search.</p>
+
+    <div class="sidebar-foot">
+      <button class="link-btn" id="resetBtn">Reset progress</button>
+      <span class="version">Kernel v11.3 · MIT</span>
+    </div>
+  </aside>
+
+  <div class="content">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menuBtn" aria-label="Open course navigation" aria-controls="sidebar" aria-expanded="false">
+        <span class="bars" aria-hidden="true"><i></i><i></i><i></i></span>
+      </button>
+      <p class="crumbs">
+        <span class="crumb-course">Field Guide</span>
+        <span class="crumb-sep" aria-hidden="true">/</span>
+        <span id="crumbModule">Overview</span>
+      </p>
+      <div class="top-meter">
+        <div class="meter" aria-hidden="true"><i id="topBarFill"></i></div>
+        <span id="topPct">0%</span>
+      </div>
+    </header>
+
+    <main id="main" class="main" tabindex="-1">
+      <div id="lesson" class="lesson"></div>
+    </main>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="course.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,167 @@
+<section class="hero">
+  <p class="eyebrow">Module 11 · 40 minutes</p>
+  <h1>Architecture: from requirements to a task set</h1>
+  <p class="lede">The API is the easy part. The design is deciding how many tasks exist, what each owns, and which one may block on what — before writing a line of code.</p>
+  <ul class="chips">
+    <li class="chip">Decomposition</li>
+    <li class="chip">Rate monotonic</li>
+    <li class="chip">Data ownership</li>
+    <li class="chip">Patterns</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Turn a timing requirements table into a defensible task list.</li>
+      <li>Assign priorities and check CPU utilization before coding.</li>
+      <li>Apply single-writer ownership so most locks disappear.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Start with a timing table, not a task list</h2>
+
+<p>Write one row per activity, in plain language, before choosing any API:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Activity</th><th>Trigger</th><th>Period</th><th>Deadline</th><th>Worst-case work</th><th>Blocks on</th></tr></thead>
+  <tbody>
+    <tr><td>Read environment sensor</td><td>Timer</td><td>10 ms</td><td>2 ms</td><td>1.2 ms</td><td>I2C bus</td></tr>
+    <tr><td>Filter + threshold</td><td>Sample ready</td><td>10 ms</td><td>5 ms</td><td>0.4 ms</td><td>Queue</td></tr>
+    <tr><td>Write SD batch</td><td>Batch full</td><td>1 s</td><td>500 ms</td><td>80 ms</td><td>SD card</td></tr>
+    <tr><td>UART command line</td><td>Byte received</td><td>event</td><td>20 ms</td><td>0.3 ms</td><td>UART</td></tr>
+    <tr><td>Feed watchdog, health</td><td>Timer</td><td>1 s</td><td>10 ms</td><td>0.1 ms</td><td>—</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>This table answers the three questions that matter: which work is periodic, which is event-driven, and where the deadlines are. It also exposes trouble early — if the sum of worst-case work exceeds the periods, no amount of RTOS will save the design.</p>
+
+<h2>Decomposition heuristics</h2>
+
+<ol class="steps">
+  <li><strong>One task per blocking resource.</strong> A sensor on a slow bus, a display, an SD card: each deserves an owner task that other code asks through a queue. Blocking is then contained.</li>
+  <li><strong>One task per independent rate.</strong> 1 kHz control and 1 Hz telemetry do not belong in the same loop.</li>
+  <li><strong>One task per state machine that can block.</strong> A protocol stack or UI flow is easier to read as a task with a blocking wait at the top of its loop.</li>
+  <li><strong>Do not create a task per function.</strong> Every task costs a stack (hundreds of bytes) and a context switch. Four to eight tasks covers most products.</li>
+  <li><strong>Prefer a state machine inside one task</strong> over five tasks that mostly wait on each other. Tasks are for concurrency, not for code organization.</li>
+</ol>
+
+<h2>Priorities and utilization</h2>
+
+<p>For periodic tasks, <strong>rate-monotonic</strong> assignment is the default: shorter period, higher priority. It is optimal among fixed-priority schemes, and it gives you a schedulability test you can do on paper:</p>
+
+<pre><code>U = sum(Ci / Ti)          /* Ci = worst-case execution, Ti = period */
+
+U &lt;= n * (2^(1/n) - 1)    /* n tasks: 1 task 100%, 2 tasks 82.8%,
+                             3 tasks 78%, ... asymptote 69.3% */</code></pre>
+
+<p>In practice, keep total load at or below roughly <strong>70%</strong> on a single core and leave the rest for interrupts, the tick and future features. If your table says 95%, the design is already late; simplify or move work to hardware (DMA, peripherals) before adding a faster MCU.</p>
+
+<div class="callout">
+  <span class="label">Priority checklist</span>
+  <ul style="margin:6px 0 0;padding-left:18px">
+    <li>Every priority has a one-sentence justification.</li>
+    <li>No task runs forever without blocking.</li>
+    <li>ISRs are shorter than every task's worst case.</li>
+    <li>The idle task gets measurable time (that is your CPU headroom).</li>
+  </ul>
+</div>
+
+<h2>Data ownership: the rule that deletes locks</h2>
+
+<p>Most synchronization bugs come from two writers. Fix the ownership and the locks become unnecessary:</p>
+
+<ul>
+  <li><strong>Exactly one task writes a given piece of state.</strong> Everyone else requests a change through a queue or a notification.</li>
+  <li><strong>Queues carry values, not shared references.</strong> If a pointer must cross a boundary, it points to a buffer owned by the receiver after the send.</li>
+  <li><strong>Configuration is read-only after init.</strong> Fill it before the scheduler starts and never mutate it.</li>
+  <li><strong>Hardware registers belong to one task.</strong> A register touched by two contexts needs a critical section, a mutex, or a redesign.</li>
+</ul>
+
+<p>The gatekeeper pattern from Module 7 is the structural version of this rule: the resource has an owner, the owner has a queue, and nobody else touches the hardware.</p>
+
+<h2>A state machine inside a task</h2>
+
+<pre><code>typedef enum { ST_IDLE, ST_MEASURE, ST_REPORT, ST_FAULT } state_t;
+
+static void vControllerTask(void *pv)
+{
+    state_t eState = ST_IDLE;
+    TickType_t xLast = xTaskGetTickCount();
+
+    for (;;) {
+        switch (eState) {
+        case ST_IDLE:
+            if (xQueueReceive(xCmdQueue, &amp;cmd, pdMS_TO_TICKS(50))) {
+                eState = (cmd == CMD_START) ? ST_MEASURE : ST_IDLE;
+            }
+            break;
+
+        case ST_MEASURE:
+            if (!sensor_start()) { eState = ST_FAULT; break; }
+            eState = ST_REPORT;
+            break;
+
+        case ST_REPORT:
+            /* Non-blocking wait keeps the loop responsive. */
+            if (xSemaphoreTake(xDoneSem, pdMS_TO_TICKS(100)) == pdTRUE) {
+                publish(sensor_value());
+                xTaskDelayUntil(&amp;xLast, pdMS_TO_TICKS(10));
+            } else {
+                eState = ST_FAULT;
+            }
+            break;
+
+        case ST_FAULT:
+        default:
+            report_fault();
+            eState = ST_IDLE;
+            break;
+        }
+    }
+}</code></pre>
+
+<p>Every state has a bounded wait, so a stuck sensor becomes a fault state rather than a frozen task. This shape — blocking wait at the top, explicit transitions, no nested loops — is what makes a task reviewable.</p>
+
+<h2>Pattern catalogue</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Pattern</th><th>Shape</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td>Periodic sampler</td><td>Delay-until loop, queue out</td><td>Sensors, control loops</td></tr>
+    <tr><td>Gatekeeper</td><td>Queue in, owns a peripheral</td><td>SPI/I2C buses, SD, display</td></tr>
+    <tr><td>Pipeline</td><td>Task → queue → task → queue</td><td>Acquire, filter, store</td></tr>
+    <tr><td>Command dispatcher</td><td>Queue or stream buffer in, switch on opcode</td><td>CLI, protocol handler</td></tr>
+    <tr><td>Supervisor</td><td>Ticks, checks heartbeats, feeds watchdog</td><td>Health and fault handling</td></tr>
+    <tr><td>Request/response</td><td>Request queue + reply queue per client</td><td>RPC-style drivers</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Anti-patterns</h2>
+
+<ul>
+  <li><strong>The polling loop:</strong> <code>while (!flag)</code> in a high-priority task. Replace with a blocking wait.</li>
+  <li><strong>The god task:</strong> one task that does everything “to avoid races”. Priorities and deadlines become meaningless.</li>
+  <li><strong>The shared global bus:</strong> three tasks poking the same SPI peripheral with no owner. Intermittent, unreproducible, expensive.</li>
+  <li><strong>Priority inflation:</strong> raising a task's priority to fix a latency problem instead of shortening its critical section.</li>
+  <li><strong>Task-per-function:</strong> twenty tasks, most of them blocked, all of them costing stack.</li>
+  <li><strong>Sleep as synchronization:</strong> <code>vTaskDelay(10)</code> after starting a conversion, hoping it finished.</li>
+</ul>
+
+<h2>Lab: design before you code</h2>
+
+<ol class="steps">
+  <li>Take a product you know (a thermostat, a data logger, a robot wheel controller) and fill in the timing table for it.</li>
+  <li>Propose a task list. For each task, write its owner data, its inputs, its outputs and its worst-case work.</li>
+  <li>Compute utilization. If it exceeds 70%, remove a task or move work into hardware.</li>
+  <li>Assign priorities with rate-monotonic ordering and write one sentence per priority.</li>
+  <li>Mark every piece of shared state and name its single writer. If you cannot, the design is not finished.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>A good FreeRTOS design has few tasks, obvious ownership, short critical sections and a utilization number you can quote. The code then writes itself; the review is about the table.</p>
+</div>

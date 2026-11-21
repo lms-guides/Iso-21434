@@ -1,0 +1,147 @@
+<section class="hero">
+  <p class="eyebrow">Module 06 · 35 minutes</p>
+  <h1>Queues: moving data safely</h1>
+  <p class="lede">A queue is a fixed-length FIFO that copies items and blocks when full or empty. Those three properties remove an entire class of race conditions.</p>
+  <ul class="chips">
+    <li class="chip">Producer / consumer</li>
+    <li class="chip">ISR hand-off</li>
+    <li class="chip">Backpressure</li>
+    <li class="chip">Queue sets</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Move fixed-size items between tasks and ISRs without shared globals.</li>
+      <li>Apply an explicit full-queue policy instead of hoping.</li>
+      <li>Size a queue from burst rate and worst-case consumer stall.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>The API</h2>
+
+<pre><code>QueueHandle_t xQueueCreate(UBaseType_t uxQueueLength, UBaseType_t uxItemSize);
+
+BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t wait);
+BaseType_t xQueueSendToFront(QueueHandle_t q, const void *item, TickType_t wait);
+BaseType_t xQueueOverwrite(QueueHandle_t q, const void *item);   /* length must be 1 */
+BaseType_t xQueueReceive(QueueHandle_t q, void *out, TickType_t wait);
+BaseType_t xQueuePeek(QueueHandle_t q, void *out, TickType_t wait);
+
+BaseType_t xQueueSendFromISR(QueueHandle_t q, const void *item,
+                             BaseType_t *pxHigherPriorityTaskWoken);
+
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q);
+BaseType_t xQueueReset(QueueHandle_t q);</code></pre>
+
+<p><code>xQueueSend</code> blocks while the queue is full, and <code>xQueueReceive</code> blocks while it is empty. That blocking is the feature: producers apply backpressure instead of silently dropping, and consumers sleep instead of polling.</p>
+
+<h2>Copy semantics — and the trap</h2>
+
+<p>Because the queue copies <code>uxItemSize</code> bytes, small structs are safe and self-contained:</p>
+
+<pre><code>typedef struct {
+    uint32_t ulTimestamp;
+    int16_t  sTemperature;   /* 0.01 C  */
+    uint16_t usHumidity;     /* 0.1 %RH */
+} SensorSample_t;
+
+QueueHandle_t xSensorQueue = xQueueCreate(16, sizeof(SensorSample_t));</code></pre>
+
+<p>If you send a <strong>pointer</strong>, the queue copies the pointer, not the payload. You then need a buffer pool and ownership rules, or you get the classic use-after-free where the producer overwrites a buffer the consumer is still reading.</p>
+
+<p>Sending a struct copies it; sending a pointer copies only the address:</p>
+
+<pre><code>SensorSample_t s = read_sensor();
+xQueueSend(xStructQueue, &amp;s, portMAX_DELAY);  /* safe: struct is copied */
+
+SensorSample_t *p = &amp;s;
+xQueueSend(xPointerQueue, &amp;p, portMAX_DELAY);  /* unsafe: p dangles
+                                                  after this iteration */</code></pre>
+
+<p>For large payloads: send a pointer to a buffer from a fixed pool, and return the buffer through a second queue. Never send a pointer to a stack local, and never assume the receiver is “fast enough”.</p>
+
+<h2>Producer/consumer with an ISR</h2>
+
+<pre><code>static QueueHandle_t xUartRxQueue;
+
+void USART2_IRQHandler(void)
+{
+    BaseType_t xWoken = pdFALSE;
+    uint8_t ucByte;
+
+    if (uart_rx_ready()) {
+        ucByte = uart_read_byte();
+        xQueueSendFromISR(xUartRxQueue, &amp;ucByte, &amp;xWoken);
+    }
+    portYIELD_FROM_ISR(xWoken);
+}
+
+static void vUartTask(void *pv)
+{
+    uint8_t ucByte;
+    (void)pv;
+
+    for (;;) {
+        if (xQueueReceive(xUartRxQueue, &amp;ucByte, portMAX_DELAY) == pdPASS) {
+            cli_feed(ucByte);
+        }
+    }
+}</code></pre>
+
+<p><code>portYIELD_FROM_ISR()</code> is not decoration. Without it the woken task waits for the next tick, adding up to a full millisecond of latency to every byte.</p>
+
+<h2>Sizing, and what to do when it is full</h2>
+
+<p>Queue length is a latency budget, not a guess:</p>
+
+<pre><code>length &gt;= worst_burst_rate * worst_consumer_stall
+
+/* 100 Hz sensor, SD card that can stall 200 ms: */
+100 * 0.2 = 20 items, plus ~25% margin  -&gt;  24 slots</code></pre>
+
+<p>Then choose a policy and write it in a comment next to the send:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Policy</th><th>Code</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td>Backpressure</td><td><code>xQueueSend(q, &amp;i, pdMS_TO_TICKS(5))</code></td><td>Control data; slowing the producer is correct</td></tr>
+    <tr><td>Drop newest</td><td><code>xQueueSend(q, &amp;i, 0)</code> and count failures</td><td>Display refreshes, telemetry</td></tr>
+    <tr><td>Drop oldest</td><td>receive one, then send</td><td>“Latest value” streams</td></tr>
+    <tr><td>Overwrite</td><td>length-1 queue + <code>xQueueOverwrite</code></td><td>Setpoints, latest command</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Queue sets</h2>
+
+<p>A task can block on only one queue. If it must serve three sources that share state, a queue set lets it wait on all of them:</p>
+
+<pre><code>QueueSetHandle_t xSet = xQueueCreateSet(lenA + lenB + lenC);
+
+xQueueAddToSet(xQueueA, xSet);
+xQueueAddToSet(xQueueB, xSet);
+xQueueAddToSet(xQueueC, xSet);
+
+QueueHandle_t xActive = xQueueSelectFromSet(xSet, portMAX_DELAY);
+
+if (xActive == xQueueA) {
+    xQueueReceive(xQueueA, &amp;msg, 0);   /* the item is guaranteed present */
+}</code></pre>
+
+<p>Prefer separate tasks unless the sources share state that must be handled atomically. A queue set is a scalpel, not a default.</p>
+
+<h2>Lab: backpressure vs drop, side by side</h2>
+
+<ol class="steps">
+  <li>Producer at 1 kHz sends a 16-bit counter to a queue of 8; the consumer sleeps 50 ms, then drains one item.</li>
+  <li>Run with a 0-tick timeout and print the failure count every second.</li>
+  <li>Change to a 20-tick timeout and watch the producer's period stretch instead.</li>
+  <li>Add <code>uxQueueMessagesWaiting()</code> to a statistics line and explain the shape of the graph.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>The queue is where you decide what “full” means. Decide once, in code, and count the losses; otherwise the field will decide for you.</p>
+</div>

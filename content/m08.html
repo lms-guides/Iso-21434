@@ -1,0 +1,131 @@
+<section class="hero">
+  <p class="eyebrow">Module 08 · 30 minutes</p>
+  <h1>Notifications, event groups and buffers</h1>
+  <p class="lede">Once queues and semaphores are solid, these primitives let you delete most of them — and make ISR hand-off cheaper and clearer.</p>
+  <ul class="chips">
+    <li class="chip">Task notification</li>
+    <li class="chip">Event group</li>
+    <li class="chip">Stream buffer</li>
+    <li class="chip">Message buffer</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Replace a semaphore with a task notification where it fits.</li>
+      <li>Wait on a combination of conditions with an event group.</li>
+      <li>Stream bytes and variable-length frames without a queue per byte.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>Direct-to-task notifications</h2>
+
+<p>Each task has an array of notification slots (<code>configTASK_NOTIFICATION_ARRAY_ENTRIES</code>, default 1). Each slot has a <strong>pending</strong> flag and a 32-bit value. Sending a notification unblocks the task directly — no queue object, roughly 45% faster and much smaller than a semaphore, according to the FreeRTOS documentation.</p>
+
+<pre><code>/* Producer side, exactly like a binary semaphore */
+vTaskNotifyGive(xConsumerTask);
+vTaskNotifyGiveFromISR(xConsumerTask, &amp;xWoken);
+
+/* Consumer side: clear to zero on exit (binary) or decrement (counting) */
+for (;;) {
+    uint32_t ulCount = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (ulCount--) {
+        do_one_unit_of_work();
+    }
+}</code></pre>
+
+<p>For values and flags rather than counts:</p>
+
+<pre><code>/* eSetBits ORs the value into the notification; eIncrement adds one;
+   eOverwrite replaces it. */
+xTaskNotify(xTarget, EVT_RX_READY | EVT_DMA_DONE, eSetBits);
+
+uint32_t ulValue = 0;
+xTaskNotifyWait(0, 0xFFFFFFFF, &amp;ulValue, pdMS_TO_TICKS(100));
+
+/* A second, independent channel */
+xTaskNotifyIndexed(xTarget, 1, 1, eSetBits);</code></pre>
+
+<p>Limits: exactly one waiter per slot, a 32-bit payload, and the sender cannot block waiting for the receiver. That is fine for the vast majority of driver-to-task signalling, and it is the right default for ISR hand-off.</p>
+
+<h2>Event groups</h2>
+
+<p>Bits can be set independently by tasks and ISRs, and a task can wait for <strong>any</strong> or <strong>all</strong> of a mask:</p>
+
+<pre><code>#define EVT_WIFI_UP     (1u &lt;&lt; 0)
+#define EVT_TIME_VALID  (1u &lt;&lt; 1)
+#define EVT_SD_READY    (1u &lt;&lt; 2)
+
+void vNetTask(void *pv)
+{
+    (void)pv;
+
+    for (;;) {
+        EventBits_t xBits = xEventGroupWaitBits(
+            xEvents,
+            EVT_WIFI_UP | EVT_TIME_VALID,   /* bits to wait for   */
+            pdTRUE,                         /* clear on exit      */
+            pdTRUE,                         /* wait for ALL       */
+            pdMS_TO_TICKS(30000));
+
+        if ((xBits &amp; (EVT_WIFI_UP | EVT_TIME_VALID)) ==
+            (EVT_WIFI_UP | EVT_TIME_VALID)) {
+            start_tls_session();
+        } else {
+            report_timeout(xBits);          /* shows which bit is missing */
+        }
+    }
+}</code></pre>
+
+<p>From an ISR, <code>xEventGroupSetBitsFromISR()</code> defers the update through the timer daemon task, so it requires <code>configUSE_TIMERS</code> and a timer command queue. The function can therefore fail with <code>pdFAIL</code> if the queue is full, unlike a task-level set.</p>
+
+<p>The timeout return value is diagnostic gold: it tells you <em>which</em> condition never arrived. Use event groups for “system is ready” gates, fault flags and multi-condition startup sequencing. They are not counters — a bit set twice is still one bit.</p>
+
+<h2>Stream and message buffers</h2>
+
+<p>A queue stores fixed-size items. A <strong>stream buffer</strong> stores bytes, designed for single-writer/single-reader byte streams: UART RX/TX, DMA hand-off, logging.</p>
+
+<pre><code>StreamBufferHandle_t xRx = xStreamBufferCreate(256, 1);  /* size, trigger */
+
+/* ISR */
+size_t n = xStreamBufferSendFromISR(xRx, &amp;ucByte, 1, &amp;xWoken);
+
+/* Task: block until at least the trigger level is available */
+size_t got = xStreamBufferReceive(xRx, buf, sizeof buf, portMAX_DELAY);</code></pre>
+
+<p>A <strong>message buffer</strong> is the same object with a length prefix, so it can carry variable-length records — one JSON line, one protocol frame — instead of single bytes.</p>
+
+<p>Both require exactly one reader and one writer. With several producers, put a queue or a mutex in front. Unlike a queue, they truncate rather than block a sender forever on the ISR path, so check the return value and count losses.</p>
+
+<h2>Choosing a primitive</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Need</th><th>Primitive</th></tr></thead>
+  <tbody>
+    <tr><td>One producer, one consumer, fixed-size items</td><td>Queue</td></tr>
+    <tr><td>Many producers, one consumer, fixed-size items</td><td>Queue</td></tr>
+    <tr><td>ISR → task, “go do the thing”, one waiter</td><td>Task notification</td></tr>
+    <tr><td>ISR → task, every event must be counted</td><td>Counting semaphore or queue</td></tr>
+    <tr><td>Wait for A <strong>and</strong> B (and C)</td><td>Event group</td></tr>
+    <tr><td>Byte stream from UART or DMA</td><td>Stream buffer</td></tr>
+    <tr><td>Variable-length frames</td><td>Message buffer</td></tr>
+    <tr><td>Protect a peripheral across tasks</td><td>Mutex, or a gatekeeper task</td></tr>
+    <tr><td>Protect a few instructions shared with an ISR</td><td>Critical section</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Lab: convert a semaphore design to notifications</h2>
+
+<ol class="steps">
+  <li>Take the ISR hand-off from Module 7 and replace <code>xSemaphoreGiveFromISR</code> with <code>vTaskNotifyGiveFromISR</code>.</li>
+  <li>Compare binary size with <code>arm-none-eabi-size</code> before and after — you should save a few hundred bytes plus the semaphore object.</li>
+  <li>Measure ISR-to-task latency by toggling a pin at the top of the task.</li>
+  <li>Break it deliberately: add a second waiter on the same notification slot and explain the result.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>Reach for a notification first for one-to-one signalling, a queue for data, and an event group for conditions. The cheapest primitive that expresses the invariant is also the easiest to review.</p>
+</div>

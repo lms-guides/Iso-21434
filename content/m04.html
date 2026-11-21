@@ -1,0 +1,131 @@
+<section class="hero">
+  <p class="eyebrow">Module 04 · 30 minutes</p>
+  <h1>Tasks, priorities and stacks</h1>
+  <p class="lede">Creating a task takes one call. Choosing its priority and stack size takes evidence — this module shows you how to produce that evidence.</p>
+  <ul class="chips">
+    <li class="chip">xTaskCreate</li>
+    <li class="chip">Priorities</li>
+    <li class="chip">Stack sizing</li>
+    <li class="chip">High-water mark</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Create, suspend, resume and delete tasks correctly.</li>
+      <li>Assign priorities from deadlines rather than from importance.</li>
+      <li>Size stacks by measurement instead of guesswork.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>The API you need</h2>
+
+<pre><code>BaseType_t xTaskCreate(TaskFunction_t pvTaskCode,
+                       const char *pcName,
+                       configSTACK_DEPTH_TYPE usStackDepth,  /* words */
+                       void *pvParameters,
+                       UBaseType_t uxPriority,
+                       TaskHandle_t *pxCreatedTask);
+
+BaseType_t xTaskCreateStatic(/* ... , */ StackType_t *puxStackBuffer,
+                             StaticTask_t *pxTaskBuffer);
+
+void vTaskDelete(TaskHandle_t xTask);      /* NULL = delete self */
+void vTaskSuspend(TaskHandle_t xTask);     /* NULL = self */
+void vTaskResume(TaskHandle_t xTask);
+BaseType_t xTaskResumeFromISR(TaskHandle_t xTask);
+UBaseType_t uxTaskPriorityGet(TaskHandle_t xTask);
+void vTaskPrioritySet(TaskHandle_t xTask, UBaseType_t uxNewPriority);</code></pre>
+
+<p>Rules that are not optional:</p>
+
+<ul>
+  <li><strong>A task function must never return.</strong> Loop forever, or call <code>vTaskDelete(NULL)</code> before returning. Returning falls into no caller and is undefined behaviour.</li>
+  <li><strong><code>pvParameters</code> must outlive the call.</strong> Never pass the address of a local in <code>main()</code> that later goes out of scope, and never pass a pointer to a buffer another task mutates without synchronization.</li>
+  <li><strong>Check the return value.</strong> <code>xTaskCreate</code> returns <code>pdPASS</code> or <code>errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY</code>. In a product, a failed creation at boot is fatal: log it and reset.</li>
+  <li><strong>Names are for humans and debuggers.</strong> Short, unique names (<code>sensor</code>, <code>lcd</code>, <code>cli</code>) show up in <code>vTaskListTasks</code> and every trace tool.</li>
+</ul>
+
+<h2>Choosing priorities</h2>
+
+<p>A priority assignment that survives review, in order of application:</p>
+
+<ol class="steps">
+  <li><strong>Assign by deadline, not importance.</strong> The task with the tightest deadline gets the highest priority. A “critical” task that runs every ten seconds does not need priority 7.</li>
+  <li><strong>Highest: short, hard-deadline work</strong> — control loop, safety monitor, watchdog kicker.</li>
+  <li><strong>Middle: event-driven workers</strong> — protocol parsers, command handlers, UI.</li>
+  <li><strong>Lowest: soft-deadline bulk work</strong> — logging, SD writes, telemetry.</li>
+  <li><strong>Leave gaps.</strong> Use 0, 1, 2, 5, 6 rather than 0–4, so a task can be inserted later without renumbering.</li>
+</ol>
+
+<p>More than three or four distinct levels is usually a sign that the design is unclear. Equal priorities plus time slicing are often better than a fragile eight-level hierarchy.</p>
+
+<div class="callout warn">
+  <span class="label">Starvation</span>
+  <p>A ready high-priority task prevents every lower-priority task from running. If it never blocks, nothing below it runs — not even the idle task, which means no <code>vApplicationIdleHook</code> and no low-power sleep. Every high-priority task must block somewhere.</p>
+</div>
+
+<h2>Stack sizing by measurement</h2>
+
+<p>With <code>configCHECK_FOR_STACK_OVERFLOW</code> at 2, the kernel paints new stacks with a known pattern, so the unused high-water mark can be read directly:</p>
+
+<pre><code>UBaseType_t uxWordsFree = uxTaskGetStackHighWaterMark(NULL);
+
+/* Headroom in bytes: */
+size_t uxBytesFree = (size_t)uxWordsFree * sizeof(StackType_t);</code></pre>
+
+<p>The procedure:</p>
+
+<ol class="steps">
+  <li><strong>Start generous:</strong> 512 words for anything calling <code>printf</code>, 256 for simple logic, 128 as a floor.</li>
+  <li><strong>Run the worst case path:</strong> every branch, every error path, deepest ISR nesting, with logging enabled.</li>
+  <li><strong>Read the high-water mark.</strong> If headroom is under about 30%, add stack.</li>
+  <li><strong>Freeze the number with a comment:</strong> <code>/* 384 words; measured 210 used, 260 worst case */</code>.</li>
+</ol>
+
+<p>Things that eat stack silently: <code>printf</code>/<code>snprintf</code> with float formatting (2–4 KB), <code>malloc</code> inside a task, deep HAL call chains, large local buffers, and floating-point context save where the port saves FPU registers.</p>
+
+<h2>Deleting a task without leaking</h2>
+
+<p><code>vTaskDelete(NULL)</code> frees the task's stack and TCB only if the idle task gets to run — which is why a high-priority task that deletes itself and a starved idle task can leak memory. Two other rules:</p>
+
+<ul>
+  <li>Memory the task allocated with <code>malloc</code> is <em>not</em> freed for you. Either clean up before deleting, or do not use dynamic allocation in a task that can end.</li>
+  <li>A deleted task's handle becomes invalid immediately. Any other task holding it will corrupt the scheduler when it uses it. Prefer suspend/resume, or a supervising task that owns the lifecycle.</li>
+</ul>
+
+<h2>Lab: make preemption visible</h2>
+
+<pre><code>static void vHighTask(void *p)
+{
+    (void)p;
+    for (;;) {
+        gpio_set(LED_HIGH);
+        busy_wait_us(200);
+        gpio_clear(LED_HIGH);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void vLowTask(void *p)
+{
+    (void)p;
+    for (;;) {
+        gpio_set(LED_LOW);
+        busy_wait_us(200);
+        gpio_clear(LED_LOW);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}</code></pre>
+
+<ol class="steps">
+  <li>Create both at priority 2 and confirm they time-slice: both LEDs blink at 10 ms.</li>
+  <li>Raise <code>vHighTask</code> to 3 and watch the low LED show only the leftover gaps.</li>
+  <li>Remove the <code>vTaskDelay</code> from <code>vHighTask</code> and confirm the low task stops completely.</li>
+  <li>Measure the high task's period with a scope, then with <code>xTaskDelayUntil</code>, and note the difference.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>A task is a deadline, a priority, a stack and an owner. If any of the four is unknown, the task is not ready to ship.</p>
+</div>

@@ -1,0 +1,153 @@
+<section class="hero">
+  <p class="eyebrow">Module 03 · 25 minutes</p>
+  <h1>FreeRTOSConfig.h: the contract</h1>
+  <p class="lede">Every behaviour you will later debug is decided in one header. Read it as a design document, not as boilerplate copied from a demo.</p>
+  <ul class="chips">
+    <li class="chip">Configuration</li>
+    <li class="chip">Heap size</li>
+    <li class="chip">Tick rate</li>
+    <li class="chip">NVIC ceiling</li>
+  </ul>
+  <div class="objectives">
+    <h2>By the end of this module</h2>
+    <ul>
+      <li>Read and justify the twenty config values that actually matter.</li>
+      <li>Distinguish word-based stack sizes from byte-based heap sizes.</li>
+      <li>Derive the interrupt priority ceiling from your MCU's implemented priority bits.</li>
+    </ul>
+  </div>
+</section>
+
+<h2>A config you can defend</h2>
+
+<p>This is a reasonable starting point for a Cortex-M3/M4/M7 product. Every commented line is a decision, not a default.</p>
+
+<pre><code>#ifndef FREERTOS_CONFIG_H
+#define FREERTOS_CONFIG_H
+
+/* ---------------- Scheduler ---------------- */
+#define configUSE_PREEMPTION                     1  /* 1 in virtually all products */
+#define configUSE_TIME_SLICING                   1  /* equal priorities round-robin */
+#define configUSE_PORT_OPTIMISED_TASK_SELECTION  1  /* CLZ-based; max 32 priorities */
+#define configMAX_PRIORITIES                     8  /* 0..7, higher number = urgent */
+#define configTICK_RATE_HZ                       1000 /* 1 ms tick */
+#define configCPU_CLOCK_HZ                       (SystemCoreClock)
+
+/* ---------------- Memory ---------------- */
+#define configSUPPORT_DYNAMIC_ALLOCATION         1
+#define configSUPPORT_STATIC_ALLOCATION          0
+#define configTOTAL_HEAP_SIZE                    (24 * 1024)  /* bytes (heap_4) */
+#define configMINIMAL_STACK_SIZE                 128    /* WORDS, not bytes */
+#define configSTACK_DEPTH_TYPE                   uint16_t
+
+/* ---------------- Objects ---------------- */
+#define configUSE_MUTEXES                        1
+#define configUSE_RECURSIVE_MUTEXES              1
+#define configUSE_COUNTING_SEMAPHORES            1
+#define configUSE_TASK_NOTIFICATIONS             1
+#define configTASK_NOTIFICATION_ARRAY_ENTRIES    2
+#define configQUEUE_REGISTRY_SIZE                8
+
+/* ---------------- Software timers ---------------- */
+#define configUSE_TIMERS                         1
+#define configTIMER_TASK_PRIORITY                (configMAX_PRIORITIES - 1)
+#define configTIMER_QUEUE_LENGTH                 10
+#define configTIMER_TASK_STACK_DEPTH             256
+
+/* ---------------- Hooks and diagnostics ---------------- */
+#define configUSE_IDLE_HOOK                      1
+#define configUSE_TICK_HOOK                      0
+#define configCHECK_FOR_STACK_OVERFLOW           2
+#define configUSE_MALLOC_FAILED_HOOK             1
+#define configUSE_TRACE_FACILITY                 1
+#define configUSE_STATS_FORMATTING_FUNCTIONS     1
+#define configGENERATE_RUN_TIME_STATS            0   /* enable in Module 12 */
+#define configASSERT(x) \
+    if ((x) == 0) { taskDISABLE_INTERRUPTS(); for (;;) { } }
+
+/* ---------------- Cortex-M interrupt priorities ---------------- */
+#define configPRIO_BITS                          4   /* check your MCU: 3..8 */
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY      15
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+#define configKERNEL_INTERRUPT_PRIORITY \
+    (configLIBRARY_LOWEST_INTERRUPT_PRIORITY &lt;&lt; (8 - configPRIO_BITS))
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY \
+    (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY &lt;&lt; (8 - configPRIO_BITS))
+
+/* ---------------- Trim the API surface ---------------- */
+#define INCLUDE_vTaskPrioritySet                1
+#define INCLUDE_uxTaskPriorityGet               1
+#define INCLUDE_vTaskDelete                     1
+#define INCLUDE_vTaskSuspend                    1
+#define INCLUDE_xTaskDelayUntil                 1
+#define INCLUDE_vTaskDelay                      1
+#define INCLUDE_xTaskGetSchedulerState          1
+#define INCLUDE_xTaskGetCurrentTaskHandle       1
+#define INCLUDE_uxTaskGetStackHighWaterMark     1
+#endif</code></pre>
+
+<h2>The three lines people get wrong</h2>
+
+<ol class="steps">
+  <li><strong>Stack depth is in words.</strong> On Cortex-M, <code>256</code> means 256 <code>StackType_t</code>, i.e. 1024 bytes. <code>configMINIMAL_STACK_SIZE</code> and <code>usStackDepth</code> are words; <code>configTOTAL_HEAP_SIZE</code> is bytes. Check <code>portSTACK_TYPE</code> in <code>portmacro.h</code> if a port surprises you.</li>
+  <li><strong>The heap size is bytes and only applies to heap_1/2/4/5.</strong> With <code>heap_3</code> it is ignored — the C library heap in your linker script is what matters instead.</li>
+  <li><strong>The syscall ceiling must be derived from implemented priority bits.</strong> Hard-coding <code>0x50</code> works on a 4-bit part and fails silently on a 3-bit one. The macros above produce <code>0x50</code> for 4 bits and <code>0xA0</code> for 3.</li>
+</ol>
+
+<div class="callout">
+  <span class="label">Unit trap</span>
+  <p>A 512-word stack is 2 KB. On a 20 KB RAM part, five of those plus a 24 KB heap will not link — and if the heap is in internal RAM via a linker section, the failure appears as a weird reset rather than a compile error. Write the budget down before the build does it for you.</p>
+</div>
+
+<h2>What each family of options costs</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Option</th><th>Turn it on when</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td><code>configUSE_TIMERS</code></td><td>You want debounce, timeouts or periodic callbacks without a task</td><td>One task, one queue, stack from the heap</td></tr>
+    <tr><td><code>configUSE_MUTEXES</code></td><td>You share a peripheral between tasks</td><td>Small code cost; enables priority inheritance</td></tr>
+    <tr><td><code>configUSE_TASK_NOTIFICATIONS</code></td><td>Always — it is the cheapest ISR-to-task signal</td><td>One 32-bit value + flag per slot per task</td></tr>
+    <tr><td><code>configUSE_TRACE_FACILITY</code></td><td>You will debug or measure anything</td><td>~1–2 KB code</td></tr>
+    <tr><td><code>configCHECK_FOR_STACK_OVERFLOW</code></td><td>During development, always</td><td>A few cycles per context switch (level 1) or a canary check (level 2)</td></tr>
+    <tr><td><code>configMAX_PRIORITIES</code></td><td>Only as many levels as you can justify</td><td>One ready list per level; RAM and scan time</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Hooks are not optional in development</h2>
+
+<pre><code>void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    taskDISABLE_INTERRUPTS();
+    panic_log("stack overflow: %s", pcTaskName);
+    for (;;) { }
+}
+
+void vApplicationMallocFailedHook(void)
+{
+    taskDISABLE_INTERRUPTS();
+    panic_log("kernel allocation failed");
+    for (;;) { }
+}
+
+void vApplicationIdleHook(void)
+{
+    __WFI();   /* sleep until the next interrupt; remove if you measure spin */
+}</code></pre>
+
+<p>An assert that stops the board with the task name on a UART or in a retained RAM buffer is worth more than a week of print-statement debugging. In production, replace the infinite loop with a logged reset — but keep the hook.</p>
+
+<h2>Lab: break the config on purpose</h2>
+
+<ol class="steps">
+  <li>Set <code>configTOTAL_HEAP_SIZE</code> to 2048 and create four 512-word tasks. Watch <code>vTaskStartScheduler()</code> return, then make the malloc hook print.</li>
+  <li>Set <code>configCHECK_FOR_STACK_OVERFLOW</code> to 0 and recurse inside a task until it corrupts a neighbour. Notice that nothing tells you what happened — that is the lesson.</li>
+  <li>Print <code>configMAX_SYSCALL_INTERRUPT_PRIORITY</code> at boot and compare it with the <code>NVIC_IPR</code> width in your MCU reference manual.</li>
+</ol>
+
+<div class="callout ok">
+  <span class="label">Key takeaway</span>
+  <p>If you cannot explain why a config value has the number it has, it is a latent bug with a delay fuse. Twenty values, twenty justifications.</p>
+</div>
