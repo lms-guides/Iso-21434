@@ -6,6 +6,7 @@
   var modules = COURSE.modules;
   var byId = new Map(modules.map(function (m) { return [m.id, m]; }));
   var STORE = "freertos-field-guide-v1";
+  var THEME_KEY = "freertos-field-guide-theme";
   var LETTERS = ["A", "B", "C", "D", "E"];
 
   var els = {
@@ -27,6 +28,7 @@
     lesson: document.getElementById("lesson"),
     main: document.getElementById("main"),
     resetBtn: document.getElementById("resetBtn"),
+    themeBtn: document.getElementById("themeBtn"),
     toast: document.getElementById("toast")
   };
 
@@ -524,6 +526,57 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  /* ---------------- Theme ---------------- */
+
+  function storedTheme() {
+    try {
+      var value = localStorage.getItem(THEME_KEY);
+      return value === "dark" || value === "light" ? value : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function systemTheme() {
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark"
+      : "light";
+  }
+
+  function applyTheme(theme, persist) {
+    var dark = theme === "dark";
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    els.themeBtn.setAttribute("aria-pressed", dark ? "true" : "false");
+    var label = dark ? "Switch to light theme" : "Switch to dark theme";
+    els.themeBtn.setAttribute("aria-label", label);
+    els.themeBtn.title = label;
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", dark ? "#0d1220" : "#f4f6f9");
+    if (persist) {
+      try {
+        localStorage.setItem(THEME_KEY, dark ? "dark" : "light");
+      } catch (err) {
+        /* Private mode: the choice applies for this session only. */
+      }
+    }
+  }
+
+  els.themeBtn.addEventListener("click", function () {
+    var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    applyTheme(next, true);
+  });
+
+  applyTheme(storedTheme() || systemTheme(), false);
+
+  if (window.matchMedia) {
+    var themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+    var onSystemThemeChange = function (event) {
+      if (!storedTheme()) applyTheme(event.matches ? "dark" : "light", false);
+    };
+    if (themeMedia.addEventListener) themeMedia.addEventListener("change", onSystemThemeChange);
+    else if (themeMedia.addListener) themeMedia.addListener(onSystemThemeChange);
   }
 
   /* ---------------- Boot ---------------- */

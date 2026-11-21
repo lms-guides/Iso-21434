@@ -5,7 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>FreeRTOS Field Guide — a 15-module course</title>
 <meta name="description" content="A step-by-step, practical FreeRTOS course: tasks, queues, synchronization, memory, architecture, debugging, a full capstone and a hands-on first-project tutorial." />
-<meta name="theme-color" content="#0f172a" />
+<meta name="theme-color" content="#f4f6f9" />
+<script>
+  /* Apply the saved theme before first paint so there is no light flash. */
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem("freertos-field-guide-theme"); } catch (e) {}
+    var dark = saved ? saved === "dark"
+      : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  })();
+</script>
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -65,6 +75,10 @@
         <div class="meter" aria-hidden="true"><i id="topBarFill"></i></div>
         <span id="topPct">0%</span>
       </div>
+      <button class="icon-btn theme-btn" id="themeBtn" type="button" aria-label="Switch to dark theme" title="Switch to dark theme">
+        <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"></path></svg>
+        <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"></circle><path d="M12 2.5v2.2M12 19.3v2.2M4.4 4.4l1.6 1.6M18 18l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.4 19.6L6 18M18 6l1.6-1.6"></path></svg>
+      </button>
     </header>
 
     <main id="main" class="main" tabindex="-1">
